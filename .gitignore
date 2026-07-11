@@ -1,6 +1,8 @@
+# Runtime artifacts and local editor state — not source.
 *.json
 *.log
 *.tmp
 reports/
+# PNG exports from -ExportForCursor (may contain sensitive screenshots)
 output/
 .vscode/
