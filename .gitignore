@@ -5,4 +5,6 @@
 reports/
 # PNG exports from -ExportForCursor (may contain sensitive screenshots)
 output/
+# Timestamped copies of settings files made by -Fix (may contain personal settings)
+backups/
 .vscode/

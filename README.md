@@ -1,6 +1,6 @@
 # Windows Clipboard Diagnostics MVP
 
-Local, dependency-free PowerShell utility that **diagnoses** Windows clipboard text/image round-trips, **optionally disables** a known PowerToys Mouse Without Borders clipboard-sharing blocker, and **exports** clipboard images to PNG as a workaround for Cursor Agent on Windows (which often ignores `Ctrl+V` for images).
+Local, dependency-free PowerShell utility for diagnosing Windows clipboard problems. It tests clipboard text/image round-trips, checks known clipboard blockers, diagnoses terminal and browser paste paths, optionally repairs a PowerToys Mouse Without Borders setting, and exports clipboard images as a workaround for Cursor Agent on Windows.
 
 This repository is **not** a Cursor patch, installer, SaaS product, malware scanner, or cloud service.
 
@@ -8,10 +8,12 @@ This repository is **not** a Cursor patch, installer, SaaS product, malware scan
 
 ```
 clipboard_diagnostics_mvp/
-├── clipboard-test.ps1   # Single entrypoint: diagnose | -Fix | -ExportForCursor
+├── clipboard-test.ps1   # Single entrypoint for diagnostics and optional repair
 ├── README.md            # Usage, safety, troubleshooting, audit notes
 ├── LICENSE              # MIT (Kozphy, 2026)
 ├── .gitignore           # Ignores logs, reports/, output/, editor junk
+├── tests/
+│   └── Run-Tests.ps1     # Dependency-free pure-helper tests
 └── output/              # Created at runtime for exported PNGs (gitignored)
 ```
 
@@ -19,12 +21,13 @@ clipboard_diagnostics_mvp/
 |-----------|----------------|---------|
 | `clipboard-test.ps1` | All runtime behavior: tests, remediation, export, exit codes | Human operator / local shell |
 | `.\output\` | Timestamped PNG exports for Cursor drag-and-drop | `-ExportForCursor` |
+| `.\reports\` and `.\backups\` | Optional diagnostic reports and settings backups | Default report / `-Fix` |
 | PowerToys MWB `settings.json` | External config read/optionally edited when `-Fix` runs | `-Fix` path only |
 
 **Control flow (verified in script):**
 
-1. If `-ExportForCursor` → export clipboard image/file-drop → summary → exit  
-2. Else → text round-trip → image round-trip → known-blocker check (`-Fix` may mutate MWB settings + restart processes) → Cursor guidance → summary → exit  
+1. `-ExportForCursor`, `-Watch`, `-TerminalPaste`, `-BrowserTest`, and `-BrowserPasteTest` each select a dedicated mode.
+2. Without a mode switch, run clipboard round-trips, known-blocker checks, editor checks, optional `-Fix` remediation, then show guidance and a summary.
 
 Exit codes: `0` no remaining issues, `1` remaining issues, `2` hard error (`$script:HadError`).
 
@@ -38,10 +41,11 @@ Forum reference: [Agent chat clipboard image paste does not work](https://forum.
 
 ## What it checks / does
 
-1. **Text round-trip** — write a unique string, read it back  
-2. **Image round-trip** — write a small bitmap, confirm the clipboard still contains an image  
-3. **Known blocker** — PowerToys Mouse Without Borders **Share Clipboard**  
-4. **Cursor workaround** — export the current clipboard image to `.\output\` for drag-and-drop  
+1. **Clipboard health** — text, Unicode/multiline text, image, clipboard owner, formats, locks, and known blockers.
+2. **Paste paths** — terminal paste checks and browser clipboard write/receive tests.
+3. **Editor checks** — known terminal and editor keybinding/clipboard settings.
+4. **PowerToys repair** — optionally disable Mouse Without Borders **Share Clipboard** with `-Fix`.
+5. **Cursor workaround** — export the current clipboard image to `.\output\` for drag-and-drop.
 
 ## Requirements
 
@@ -65,7 +69,7 @@ Forum reference: [Agent chat clipboard image paste does not work](https://forum.
 powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1
 ```
 
-**Side effects:** overwrites the Windows clipboard; does not restore prior contents.
+**Side effects:** saves supported clipboard formats in memory, performs temporary round-trip tests, and restores supported formats afterward. Windows may not permit restoration of every format; the script reports this. Use `-NoReport` to skip the JSON report.
 
 ### Diagnose and fix PowerToys Share Clipboard
 
@@ -73,7 +77,32 @@ powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1
 powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -Fix
 ```
 
-**Side effects:** same clipboard overwrite as diagnose; if Share Clipboard is enabled, writes `ShareClipboard.value=false` into the current user's Mouse Without Borders `settings.json` and may stop/restart `PowerToys.MouseWithoutBorders` / `PowerToys`.
+**Side effects:** performs the same temporary clipboard tests as diagnose; if Share Clipboard is enabled, creates a settings backup, writes `ShareClipboard.value=false` into the current user's Mouse Without Borders `settings.json`, and may stop/restart PowerToys processes.
+
+### Diagnose HackMD-to-Google-Keep paste in Edge
+
+This test distinguishes a browser clipboard-receive problem from a Google Keep-specific problem. It opens a temporary `127.0.0.1` page in Edge; it does not contact HackMD or Google Keep, alter the clipboard, or create a browser profile.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -BrowserPasteTest -Browser msedge -NoReport
+```
+
+1. When the local page opens, switch back to HackMD and copy the note text.
+2. Return to the test page, click its box, and press **Ctrl+V**. The text will not appear in the page.
+3. Read the result in PowerShell:
+   - **Non-empty text received:** Edge received text from the clipboard. Try pasting the same copied text into Keep; if it still fails, the issue is likely specific to Keep or its page context.
+   - **Paste event, but no text:** Edge received a paste action but exposed no non-empty plain/HTML text.
+   - **No event:** inconclusive unless the test box had focus and Ctrl+V was pressed after copying.
+
+The page sends only clipboard format names and the character lengths of plain/HTML text to its short-lived loopback listener. It prevents insertion; clipboard text is never included in the request, displayed, or saved. The listener stops when the test ends. Use `-InPrivate` to compare with Edge InPrivate without changing profiles.
+
+### Test browser clipboard writes
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -BrowserTest -Browser msedge
+```
+
+This separate test writes a generated token from the local page to the Windows clipboard and restores supported clipboard formats afterward. It does not test paste into Google Keep.
 
 ### Export clipboard image for Cursor Agent (recommended workaround)
 
@@ -110,7 +139,9 @@ Exit codes:
 
 ## Safety boundaries
 
-- **Diagnose / `-Fix` mode** replaces clipboard contents and does **not** restore them.  
+- **Diagnose / `-Fix` mode** temporarily replaces clipboard contents and restores supported saved formats afterward; some formats cannot be restored through Windows clipboard APIs.
+- **`-BrowserPasteTest`** does not modify the clipboard. It reports format names and text lengths only and serves the page/listener on loopback.
+- **`-BrowserTest` / `-TerminalPaste`** use generated test data and restore supported clipboard formats afterward.
 - **`-ExportForCursor` mode** reads the clipboard and writes a PNG under `.\output\`; it does not clear the clipboard on the success path before save.  
 - Does **not** modify the Cursor IDE binary or settings.  
 - Does **not** prove malware, surveillance, hacking, or compromise.  
@@ -120,9 +151,9 @@ Exit codes:
 
 ## Privacy warning
 
-- Do not run diagnose/`-Fix` while sensitive clipboard content is present.  
+- Diagnose and `-Fix` save supported clipboard formats in memory while testing. Avoid running them when clipboard content is sensitive, and use `-NoRestore` only if you intentionally want to leave test data on the clipboard.
 - Exported images in `.\output\` may be sensitive; delete them when finished. That folder is gitignored.  
-- The script does not intentionally dump prior clipboard text payloads; diagnose prints only the generated test GUID.  
+- The script does not print or save prior clipboard text payloads. Reports are metadata-oriented; use `-NoReport` to suppress report creation.
 
 ## Troubleshooting
 
@@ -132,6 +163,7 @@ Exit codes:
 - Press Windows + V to check clipboard history.  
 - Restart Windows Explorer.  
 - Check whether the problem happens in all applications or only one.  
+- For HackMD-to-Keep failures in Edge, run `-BrowserPasteTest -Browser msedge`. A successful receive confirms Edge can read the copied text at the browser page level; if Keep still rejects it, investigate Keep/page-specific behavior next.
 - If you use PowerToys Mouse Without Borders and need cross-PC clipboard sharing, turn Share Clipboard back on only when required.  
 - PowerToys Advanced Paste can also interfere in some apps; try disabling it temporarily.  
 
@@ -141,8 +173,9 @@ Critical paths that change external state:
 
 | Path | External effect | How to detect | Safe recovery |
 |------|-----------------|---------------|---------------|
-| Text/image diagnose | Clipboard overwritten | Console PASS/FAIL; clipboard no longer holds prior data | Re-copy needed content |
-| `-Fix` ShareClipboard | Edits MWB `settings.json` | Re-read setting / PowerToys UI | Re-enable Share Clipboard in PowerToys |
+| Text/image diagnose | Temporarily replaces and restores supported clipboard formats | Console PASS/FAIL and restore status | Re-copy any format Windows could not restore |
+| `-BrowserPasteTest` | Opens a loopback page; reports format names and text lengths | Browser page and PowerShell result | Close the test tab; listener stops at completion |
+| `-Fix` ShareClipboard | Backs up and edits MWB `settings.json` | Re-read setting / PowerToys UI | Restore the backup or re-enable Share Clipboard in PowerToys |
 | `-Fix` restart | Stops/starts PowerToys processes | Task Manager / `Get-Process` | Start PowerToys from Start Menu |
 | `-ExportForCursor` | Writes PNG under `.\output\` | File on disk + PASS path line | Delete PNG if sensitive |
 | `-OpenFolder` | Launches Explorer | Explorer window | Close Explorer window |
@@ -154,21 +187,13 @@ Evidence available for review: console transcript of the run; `.\output\*.png` t
 - **Single-script MVP** keeps install surface zero and makes behavior auditable in one file.  
 - **Export mode is isolated** from diagnose mode so round-trip tests cannot destroy a screenshot the user just copied for Cursor.  
 - **Regex settings patch** preferred over `ConvertTo-Json` round-trip on Windows PowerShell 5.1 to reduce risk of reformatting/secret field churn in PowerToys settings.  
-- **Rejected (not implemented):** patching Cursor, global hooks, background watchers, network telemetry, automated Advanced Paste disable.  
+- **Not implemented:** patching Cursor, global hooks, background persistence, network telemetry, automated Advanced Paste disable.
 
 ## Important limitation
 
 A clipboard failure does not prove malware, surveillance, hacking, or system compromise.
 
 This repository cannot modify or hot-fix the Cursor IDE binary. The Cursor image-paste issue must be fixed by Cursor; this tool only provides a practical workaround.
-
-## Future improvements
-
-- Restore the original clipboard after diagnose mode  
-- Add Unicode and multiline tests  
-- Add JSON report export  
-- Add automated PowerShell tests  
-- Detect additional clipboard hooks beyond Mouse Without Borders  
 
 ## License
 
