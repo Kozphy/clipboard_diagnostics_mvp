@@ -879,6 +879,21 @@ function Add-CheckRecord {
 }
 
 function Write-Section {
+    <#
+    .SYNOPSIS
+        Print a section heading and set the current report section.
+    .DESCRIPTION
+        Args:
+            Title (string): Heading text, also stored as the section name on later check records.
+
+        Returns:
+            None.
+    .PARAMETER Title
+        Heading printed between blank lines.
+    .NOTES
+        Side effects: sets $script:CurrentSection and writes to the host.
+        Audit Notes: no clipboard access.
+    #>
     param([string]$Title)
     $script:CurrentSection = $Title
     Write-Host ""
@@ -886,12 +901,42 @@ function Write-Section {
 }
 
 function Write-Pass {
+    <#
+    .SYNOPSIS
+        Print a PASS line and record it for the JSON report.
+    .DESCRIPTION
+        Args:
+            Message (string): Text printed after "PASS:". Must not contain clipboard payloads.
+
+        Returns:
+            None.
+    .PARAMETER Message
+        Result text. Lengths, formats, owners, paths, and generated tokens only.
+    .NOTES
+        Side effects: host output and one $script:Checks row.
+        Audit Notes: does not change the exit code by itself.
+    #>
     param([string]$Message)
     Write-Host "PASS: $Message" -ForegroundColor Green
     Add-CheckRecord -Level 'PASS' -Message $Message
 }
 
 function Write-Fail {
+    <#
+    .SYNOPSIS
+        Print a FAIL line, mark the run failed, and record it.
+    .DESCRIPTION
+        Args:
+            Message (string): Text printed after "FAIL:". Must not contain clipboard payloads.
+
+        Returns:
+            None.
+    .PARAMETER Message
+        Failure text shown on the console and stored in the report.
+    .NOTES
+        Side effects: sets $script:HadFailure and appends a check row.
+        Audit Notes: remaining issues that should force exit code 1 also go through Add-Issue.
+    #>
     param([string]$Message)
     Write-Host "FAIL: $Message" -ForegroundColor Red
     $script:HadFailure = $true
@@ -899,6 +944,21 @@ function Write-Fail {
 }
 
 function Write-Err {
+    <#
+    .SYNOPSIS
+        Print an ERROR line and mark a hard error (exit code 2).
+    .DESCRIPTION
+        Args:
+            Message (string): Text printed after "ERROR:". Must not contain clipboard payloads.
+
+        Returns:
+            None.
+    .PARAMETER Message
+        Exception or hard-failure text.
+    .NOTES
+        Side effects: sets $script:HadError and appends a check row.
+        Audit Notes: HadError outranks remaining issues when the exit code is chosen.
+    #>
     param([string]$Message)
     Write-Host "ERROR: $Message" -ForegroundColor Red
     $script:HadError = $true
@@ -906,12 +966,42 @@ function Write-Err {
 }
 
 function Write-Info {
+    <#
+    .SYNOPSIS
+        Print an INFO line and record it for the JSON report.
+    .DESCRIPTION
+        Args:
+            Message (string): Text printed after "INFO:". Must not contain clipboard payloads.
+
+        Returns:
+            None.
+    .PARAMETER Message
+        Informational text. Does not change the exit code.
+    .NOTES
+        Side effects: host output and one $script:Checks row.
+        Audit Notes: no clipboard writes.
+    #>
     param([string]$Message)
     Write-Host "INFO: $Message"
     Add-CheckRecord -Level 'INFO' -Message $Message
 }
 
 function Write-WarnLine {
+    <#
+    .SYNOPSIS
+        Print a WARN line and record it for the JSON report.
+    .DESCRIPTION
+        Args:
+            Message (string): Text printed after "WARN:". Must not contain clipboard payloads.
+
+        Returns:
+            None.
+    .PARAMETER Message
+        Warning text. A warning alone does not set the exit code.
+    .NOTES
+        Side effects: host output and one $script:Checks row.
+        Audit Notes: call Add-Issue when the warning should remain in the summary.
+    #>
     param([string]$Message)
     Write-Host "WARN: $Message" -ForegroundColor Yellow
     Add-CheckRecord -Level 'WARN' -Message $Message

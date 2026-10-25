@@ -42,6 +42,20 @@ $script:Failed = New-Object System.Collections.Generic.List[string]
 $script:CurrentTest = ''
 
 function Assert-True {
+    <#
+    .SYNOPSIS
+        Count one assertion, or record a failure when the condition is false.
+    .DESCRIPTION
+        Args:
+            Condition (bool): Assertion result.
+            Message (string): Failure text, prefixed with the current test name.
+
+        Returns:
+            None.
+    .NOTES
+        Side effects: increments $script:Passed or appends to $script:Failed.
+        Audit Notes: test harness only; no clipboard or settings access.
+    #>
     param([bool]$Condition, [string]$Message)
     if ($Condition) {
         $script:Passed++
@@ -53,12 +67,41 @@ function Assert-True {
 }
 
 function Assert-Equal {
+    <#
+    .SYNOPSIS
+        Assert that two values have the same string form, including null.
+    .DESCRIPTION
+        Args:
+            Expected (object): Expected value. Compared with -ceq after string conversion.
+            Actual (object): Value under test.
+            Message (string): Assertion label. The expected and actual values are appended on failure.
+
+        Returns:
+            None.
+    .NOTES
+        Side effects: delegates to Assert-True.
+        Audit Notes: test harness only.
+    #>
     param($Expected, $Actual, [string]$Message)
     $ok = ($null -eq $Expected -and $null -eq $Actual) -or ($null -ne $Expected -and $null -ne $Actual -and [string]$Expected -ceq [string]$Actual)
     Assert-True $ok "$Message (expected '$Expected', got '$Actual')"
 }
 
 function Invoke-Test {
+    <#
+    .SYNOPSIS
+        Run one named test and record an unexpected throw as a failure.
+    .DESCRIPTION
+        Args:
+            Name (string): Test name printed before the body runs.
+            Body (scriptblock): Assertions for this test.
+
+        Returns:
+            None. Does not rethrow.
+    .NOTES
+        Side effects: sets $script:CurrentTest and writes PASS/FAIL lines via assertions.
+        Audit Notes: a throw inside Body is caught so later tests still run.
+    #>
     param([string]$Name, [scriptblock]$Body)
     $script:CurrentTest = $Name
     Write-Host "TEST  $Name"
