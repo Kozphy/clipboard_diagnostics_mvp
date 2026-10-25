@@ -1,0 +1,23 @@
+tests/Run-Tests.ps1
+  s_4db22f31ff4cec::t_98b6bfe779f725 45-58
+  s_4db22f31ff4cec::t_0bbcc968f72f9a 91-104
+  s_4db22f31ff4cec::t_61ebd05cb660e3 70-84
+clipboard-test.ps1
+  s_4db22f31ff4cec::t_e27f0ce4703c42 882-896,904-918,925-939,947-961,969-983,990-1004
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "987cf0642d126a8c68b73951e12ad6bbde4bd53e",
+  "prompts": {},
+  "sessions": {
+    "s_4db22f31ff4cec": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "595ede21-a006-458d-8ac5-8bc2157c881f",
+        "model": "default"
+      },
+      "human_author": "Zixsa <50504962+Kozphy@users.noreply.github.com>"
+    }
+  }
+}
