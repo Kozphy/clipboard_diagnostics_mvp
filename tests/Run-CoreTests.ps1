@@ -428,6 +428,42 @@ try {
         Assert-True ($text -match 'Tray already running; timed plain-text session not started\.') 'overlap sentence'
         Assert-True ($text -notmatch 'ShowBalloonTip') 'timed mode has no balloon'
     }
+    Invoke-Test 'scheduled task action quotes a path that contains a space' {
+        $exe = Get-ScheduledTaskExecutable
+        Assert-True ($exe -match 'System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$') 'windows powershell 5.1 host'
+        $tray = 'C:\Program Files\clipboard_diagnostics_mvp\clipboard-tray.ps1'
+        $arg = Get-ScheduledTaskActionArgument -TrayScriptPath $tray
+        Assert-Equal '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Program Files\clipboard_diagnostics_mvp\clipboard-tray.ps1"' $arg 'argument'
+        $create = Get-SchtasksCreateArguments -TrayScriptPath $tray
+        Assert-True ($create -match '/Create /F /TN "\\ClipboardDiagnosticsMvp\\PlainTextTray"') 'task name'
+        Assert-True ($create -match '/SC ONLOGON /IT /RL LIMITED') 'interactive limited logon'
+        Assert-True ($create -match '/TR ".*powershell\.exe.*"') 'tr quotes the executable'
+        Assert-True ($create -match 'Program Files') 'space path survives'
+    }
+    Invoke-Test 'Get-StartupProvider is only the scheduled task backend' {
+        $calls = New-Object System.Collections.Generic.List[object]
+        $provider = Get-StartupProvider -TrayScriptPath 'C:\Program Files\clipboard_diagnostics_mvp\clipboard-tray.ps1' -TaskBackend {
+            param($Operation, $Spec) $script:StartupCalls.Add([pscustomobject]@{ Operation = $Operation; TaskName = $Spec.TaskName; TaskPath = $Spec.TaskPath; Description = $Spec.Description })
+            if ($Operation -eq 'Query') { return [pscustomobject]@{ Installed = $true; LastTaskResult = 0; ActionPath = $Spec.ActionPath } }
+            return [pscustomobject]@{ Ok = $true }
+        }
+        Assert-Equal 'ScheduledTask' $provider.Id 'id'
+        Assert-Equal 'False' $provider.Managed 'not managed'
+        Assert-Equal '\ClipboardDiagnosticsMvp\' $provider.TaskPath 'path'
+        Assert-Equal 'PlainTextTray' $provider.TaskName 'name'
+        $script:StartupCalls = $calls
+        [void]$provider.Install.Invoke()
+        [void]$provider.Uninstall.Invoke()
+        $status = $provider.GetStatus.Invoke()
+        Assert-Equal 'Install' $calls[0].Operation 'install'
+        Assert-Equal 'PlainTextTray' $calls[0].TaskName 'install name'
+        Assert-Equal '\ClipboardDiagnosticsMvp\' $calls[0].TaskPath 'install path'
+        Assert-Equal 'Rewrites Chromium HTML clipboard copies to plain Unicode for local paste. Does not record clipboard text.' $calls[0].Description 'description'
+        Assert-Equal 'Uninstall' $calls[1].Operation 'uninstall'
+        Assert-Equal 'True' $status.Installed 'query'
+        Assert-Equal 'False' $status.Managed 'status not managed'
+        Assert-True ($provider.Id -ne 'Policy') 'no policy provider'
+    }
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue

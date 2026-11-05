@@ -1235,3 +1235,167 @@ function New-NotificationProvider {
     }
     return $provider
 }
+
+function Get-ScheduledTaskExecutable {
+    $root = [string]$env:SystemRoot
+    $root = $root.TrimEnd('\', '/')
+    return ($root + '\System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
+function Get-ScheduledTaskActionArgument {
+    param([Parameter(Mandatory = $true)][string]$TrayScriptPath)
+    return "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TrayScriptPath`""
+}
+
+function Get-SchtasksCreateArguments {
+    param([Parameter(Mandatory = $true)][string]$TrayScriptPath)
+    $executable = Get-ScheduledTaskExecutable
+    $action = Get-ScheduledTaskActionArgument -TrayScriptPath $TrayScriptPath
+    return ('/Create /F /TN "\ClipboardDiagnosticsMvp\PlainTextTray" /SC ONLOGON /IT /RL LIMITED /TR "{0} {1}"' -f $executable, $action)
+}
+
+function Get-ClipboardStartupDescription {
+    'Rewrites Chromium HTML clipboard copies to plain Unicode for local paste. Does not record clipboard text.'
+}
+
+function New-ClipboardStartupSpec {
+    param([Parameter(Mandatory = $true)][string]$TrayScriptPath)
+    $execute = Get-ScheduledTaskExecutable
+    $argument = Get-ScheduledTaskActionArgument -TrayScriptPath $TrayScriptPath
+    @{
+        TaskName         = 'PlainTextTray'
+        TaskPath         = '\ClipboardDiagnosticsMvp\'
+        Description      = (Get-ClipboardStartupDescription)
+        Execute          = $execute
+        Argument         = $argument
+        WorkingDirectory = (Split-Path -Parent $TrayScriptPath)
+        ActionPath       = ($execute + ' ' + $argument)
+        TrayScriptPath   = $TrayScriptPath
+    }
+}
+
+function Invoke-ClipboardSchtasks {
+    param([Parameter(Mandatory = $true)][string]$ArgumentLine)
+    $executable = 'schtasks.exe'
+    if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        $candidate = ($env:SystemRoot.TrimEnd('\', '/') + '\System32\schtasks.exe')
+        if (Test-Path -LiteralPath $candidate) { $executable = $candidate }
+    }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $executable
+    $startInfo.Arguments = $ArgumentLine
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $process.WaitForExit()
+    return [int]$process.ExitCode
+}
+
+function Invoke-ClipboardScheduledTaskOperation {
+    param($Operation, $Spec)
+    $taskFullName = '\ClipboardDiagnosticsMvp\PlainTextTray'
+    $moduleReady = $false
+    try {
+        Import-Module ScheduledTasks -ErrorAction Stop
+        $moduleReady = $true
+    }
+    catch {
+        $moduleReady = $false
+    }
+    if ($moduleReady) {
+        try {
+            $userName = $env:USERNAME
+            if ([string]::IsNullOrWhiteSpace($userName)) { $userName = $env:USER }
+            if ($Operation -eq 'Install') {
+                $action = New-ScheduledTaskAction -Execute $Spec.Execute -Argument $Spec.Argument -WorkingDirectory $Spec.WorkingDirectory
+                $trigger = New-ScheduledTaskTrigger -AtLogOn
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+                $principal = New-ScheduledTaskPrincipal -UserId $userName -LogonType Interactive -RunLevel Limited
+                Register-ScheduledTask -TaskName $Spec.TaskName -TaskPath $Spec.TaskPath -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $Spec.Description -Force | Out-Null
+                return [pscustomobject]@{ Ok = $true; Installed = $true; LastTaskResult = 0; ActionPath = $Spec.ActionPath }
+            }
+            if ($Operation -eq 'Uninstall') {
+                Unregister-ScheduledTask -TaskName $Spec.TaskName -TaskPath $Spec.TaskPath -Confirm:$false -ErrorAction Stop
+                return [pscustomobject]@{ Ok = $true; Installed = $false; LastTaskResult = 0; ActionPath = $Spec.ActionPath }
+            }
+            $task = Get-ScheduledTask -TaskName $Spec.TaskName -TaskPath $Spec.TaskPath -ErrorAction Stop
+            $info = $task | Get-ScheduledTaskInfo
+            $last = 0
+            if ($null -ne $info -and $null -ne $info.LastTaskResult) { $last = $info.LastTaskResult }
+            return [pscustomobject]@{ Ok = $true; Installed = $true; LastTaskResult = $last; ActionPath = $Spec.ActionPath }
+        }
+        catch {
+            $moduleReady = $false
+        }
+    }
+    try {
+        if ($Operation -eq 'Install') {
+            $code = Invoke-ClipboardSchtasks -ArgumentLine (Get-SchtasksCreateArguments -TrayScriptPath $Spec.TrayScriptPath)
+            return [pscustomobject]@{ Ok = ($code -eq 0); Installed = ($code -eq 0); LastTaskResult = $code; ActionPath = $Spec.ActionPath }
+        }
+        if ($Operation -eq 'Uninstall') {
+            $code = Invoke-ClipboardSchtasks -ArgumentLine ('/Delete /F /TN "{0}"' -f $taskFullName)
+            return [pscustomobject]@{ Ok = ($code -eq 0); Installed = $false; LastTaskResult = $code; ActionPath = $Spec.ActionPath }
+        }
+        $code = Invoke-ClipboardSchtasks -ArgumentLine ('/Query /TN "{0}"' -f $taskFullName)
+        return [pscustomobject]@{ Ok = ($code -eq 0); Installed = ($code -eq 0); LastTaskResult = $code; ActionPath = $Spec.ActionPath }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Installed = $false; LastTaskResult = 1; ActionPath = $Spec.ActionPath }
+    }
+}
+
+function Get-StartupProvider {
+    param(
+        [Parameter(Mandatory = $true)][string]$TrayScriptPath,
+        [scriptblock]$TaskBackend
+    )
+    $spec = New-ClipboardStartupSpec -TrayScriptPath $TrayScriptPath
+    $provider = [pscustomobject]@{
+        Id          = 'ScheduledTask'
+        Managed     = $false
+        TaskPath    = '\ClipboardDiagnosticsMvp\'
+        TaskName    = 'PlainTextTray'
+        Spec        = $spec
+        TaskBackend = $TaskBackend
+    }
+    $provider | Add-Member -MemberType ScriptMethod -Name InvokeBackend -Value {
+        param([string]$Operation)
+        if ($null -ne $this.TaskBackend) {
+            return (& $this.TaskBackend $Operation $this.Spec)
+        }
+        return (Invoke-ClipboardScheduledTaskOperation -Operation $Operation -Spec $this.Spec)
+    }
+    $provider | Add-Member -MemberType ScriptMethod -Name Install -Value {
+        $this.InvokeBackend('Install')
+    }
+    $provider | Add-Member -MemberType ScriptMethod -Name Uninstall -Value {
+        $this.InvokeBackend('Uninstall')
+    }
+    $provider | Add-Member -MemberType ScriptMethod -Name Test -Value {
+        $queried = $this.InvokeBackend('Query')
+        return [bool]$queried.Installed
+    }
+    $provider | Add-Member -MemberType ScriptMethod -Name GetStatus -Value {
+        $queried = $this.InvokeBackend('Query')
+        $installed = $false
+        $last = $null
+        $actionPath = $this.Spec.ActionPath
+        if ($null -ne $queried) {
+            if ($null -ne $queried.Installed) { $installed = [bool]$queried.Installed }
+            $last = $queried.LastTaskResult
+            if ($null -ne $queried.ActionPath) { $actionPath = $queried.ActionPath }
+        }
+        [pscustomobject]@{
+            Installed      = $installed
+            Managed        = $false
+            TaskPath       = $this.TaskPath
+            TaskName       = $this.TaskName
+            LastTaskResult = $last
+            ActionPath     = $actionPath
+        }
+    }
+    return $provider
+}
