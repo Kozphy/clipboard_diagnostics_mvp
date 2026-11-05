@@ -189,6 +189,12 @@ Evidence available for review: console transcript of the run; `.\output\*.png` t
 - **Regex settings patch** preferred over `ConvertTo-Json` round-trip on Windows PowerShell 5.1 to reduce risk of reformatting/secret field churn in PowerToys settings.  
 - **Not implemented:** patching Cursor, global hooks, background persistence, network telemetry, automated Advanced Paste disable.
 
+## Design / Roadmap
+
+The locked design for an always-on plain-text tray (Edge Copilot HTML clipboard → Cursor Agent blank paste) is [docs/superpowers/specs/2026-11-05-plaintext-tray-design.md](docs/superpowers/specs/2026-11-05-plaintext-tray-design.md).
+
+That document is design only. This repo still has a single entrypoint, `clipboard-test.ps1`. It does not rewrite the clipboard, and it does not install a tray or a startup task. The design keeps the existing `-Seconds` default at 120 and specifies a 600-second example for the future timed plain-text session.
+
 ## Important limitation
 
 A clipboard failure does not prove malware, surveillance, hacking, or system compromise.
