@@ -32,6 +32,9 @@
 #                      receive pasted text; reports formats and lengths only.
 #   -ExportForCursor   Read clipboard image/file-drop and write a PNG under
 #                      .\output\. Does NOT run round-trip tests.
+#   -PlainText         Foreground, time-bounded (-Seconds). Rewrites matching
+#                      HTML/Chromium copies to Unicode in place. Does not
+#                      restore HTML and does not record clipboard payloads.
 #
 # Side effects (by mode):
 #   Diagnose:       clipboard temporarily overwritten by test data, then
@@ -150,7 +153,12 @@
     Record clipboard changes in the foreground for -Seconds seconds.
 
 .PARAMETER Seconds
-    Duration of -Watch (5..3600, default 120).
+    Duration of -Watch and -PlainText (5..3600, default 120).
+
+.PARAMETER PlainText
+    Rewrite HTML and Chromium web clipboard formats to Unicode text for
+    -Seconds seconds. Does not restore the rich formats and does not record
+    clipboard text.
 
 .PARAMETER ShowText
     Include up to the first 40 characters of clipboard text in -Watch output,
@@ -257,12 +265,13 @@ param(
     [switch]$InPrivate,
     [switch]$ExportForCursor,
     [switch]$OpenFolder,
-    [switch]$NoReport
+    [switch]$NoReport,
+    [switch]$PlainText
 )
 
 $ErrorActionPreference = "Stop"
 # Script-scoped run state used for summary, JSON report and exit codes.
-$script:ToolVersion = '2.1.0'
+$script:ToolVersion = '3.0.0'
 $script:HadFailure = $false
 $script:HadError = $false
 $script:Issues = New-Object System.Collections.Generic.List[string]
@@ -271,6 +280,7 @@ $script:Checks = New-Object System.Collections.Generic.List[object]
 $script:CurrentSection = ''
 # Prefer $PSScriptRoot so output paths stay repo-relative even if cwd differs.
 $script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+. (Join-Path $script:ScriptRoot 'clipboard-core.ps1')
 $script:Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $script:Cmdlet = $PSCmdlet
 $script:NativeReady = $false
@@ -4273,11 +4283,209 @@ function Show-Summary {
         'TerminalPaste' { 'Privacy: only generated test tokens were placed on the clipboard; your clipboard was restored afterwards.' }
         'BrowserTest' { 'Privacy: only a generated token was copied by the test page; your clipboard was restored afterwards.' }
         'BrowserPasteTest' { 'Privacy: the browser test reports clipboard format names and text lengths only; clipboard contents are neither modified nor saved.' }
+        'PlainText' { 'Privacy: plain-text mode rewrites HTML and Chromium web formats to Unicode text and records character counts, format names, and process names only.' }
         default { 'Privacy: export mode reads the current clipboard image and writes a PNG under .\output\.' }
     }
     Write-Host $privacy -ForegroundColor DarkYellow
     Write-Host "Limitation: a clipboard failure does not prove malware or system compromise." -ForegroundColor DarkYellow
     Write-Host "Limitation: this repo cannot patch the Cursor Windows Ctrl+V image-paste bug." -ForegroundColor DarkYellow
+}
+
+function Test-PlainTextStopRequested {
+    try {
+        if (-not [Console]::KeyAvailable) { return $false }
+        $key = [Console]::ReadKey($true)
+        if ($key.Key -eq 'Escape') { return $true }
+        if ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control)) { return $true }
+    }
+    catch { return $false }
+    return $false
+}
+
+function Write-PlainTextMetadataLog {
+    param($Logger, [string]$Level, [int]$EventId, [string]$Reason, $Result)
+    $fields = @{
+        Level   = $Level
+        EventId = $EventId
+        Mode    = 'Timed'
+        Reason  = $Reason
+    }
+    if ($null -ne $Result) {
+        $fields.CharCount = [int]$Result.CharCount
+        $fields.Process = [string]$Result.SourceProcess
+        $fields.FormatsBefore = @($Result.FormatsBefore)
+        $fields.FormatsAfter = @($Result.FormatsAfter)
+        $fields.Sequence = [int64]$Result.SequenceAfter
+    }
+    $Logger.Write($fields)
+}
+
+function Invoke-PlainTextSession {
+    param(
+        [int]$Seconds,
+        [bool]$ShowText,
+        [switch]$WhatIf
+    )
+    $settingsResult = Read-ClipboardDiagnosticsSettings
+    $stateResult = Read-ClipboardDiagnosticsState
+    $logDirectory = Join-Path (Get-ClipboardDiagnosticsRoot) 'logs'
+    $fileLogging = $true
+    $eventLogging = $true
+    $toastOnFail = $true
+    if ($null -ne $settingsResult.Settings.logging) {
+        if ($null -ne $settingsResult.Settings.logging.file) { $fileLogging = [bool]$settingsResult.Settings.logging.file }
+        if ($null -ne $settingsResult.Settings.logging.eventLog) { $eventLogging = [bool]$settingsResult.Settings.logging.eventLog }
+    }
+    if ($null -ne $settingsResult.Settings.notifications -and $null -ne $settingsResult.Settings.notifications.toastOnFail) {
+        $toastOnFail = [bool]$settingsResult.Settings.notifications.toastOnFail
+    }
+    $logger = New-LoggingProvider -LogDirectory $logDirectory -FileEnabled $fileLogging -EventLogEnabled $eventLogging
+    $notifier = New-NotificationProvider -Kind Toast -ToastOnFail $toastOnFail
+    Publish-ClipboardStoreEvents -SettingsResult $settingsResult -StateResult $stateResult -Logger $logger
+    $storeError = [bool]($settingsResult.Corrupt -or $settingsResult.Unsupported -or $stateResult.Corrupt -or $stateResult.Unsupported)
+    $failCount = 0
+    $errorCount = 0
+    if ($storeError) { $errorCount = 1 }
+    $rewriteCount = 0
+    $events = New-Object System.Collections.Generic.List[object]
+    $writeSummary = $true
+    $gate = Get-ClipboardRuntimeGate -SettingsResult $settingsResult -StateResult $stateResult
+    $pollMs = 400
+    if ($null -ne $settingsResult.Settings.plainText -and $null -ne $settingsResult.Settings.plainText.pollIntervalMs) {
+        $pollMs = [int]$settingsResult.Settings.plainText.pollIntervalMs
+    }
+    if ($ShowText) {
+        Write-Host '-ShowText is ignored for -PlainText.'
+    }
+    if ($gate.PausedEffective) {
+        if ($settingsResult.Settings.paused) {
+            Write-Host 'Plain-text rewrite is paused.'
+        }
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-PlainTextStopRequested) { break }
+            Start-Sleep -Milliseconds ([Math]::Min($pollMs, 200))
+        }
+    }
+    else {
+        $trayHeld = $false
+        try {
+            $trayMutex = New-Object System.Threading.Mutex($false, (Get-ClipboardMutexName -Kind Tray))
+            $trayHeld = -not $trayMutex.WaitOne(0)
+            if (-not $trayHeld) { [void]$trayMutex.ReleaseMutex() }
+            $trayMutex.Dispose()
+        }
+        catch { $trayHeld = $false }
+        if ($trayHeld) {
+            Write-Host 'Tray already running; timed plain-text session not started.'
+            Write-PlainTextMetadataLog -Logger $logger -Level 'INFO' -EventId 1106 -Reason 'TrayAlreadyRunning' -Result $null
+            $writeSummary = $false
+        }
+        else {
+            $sessionMutex = $null
+            $sessionHeld = $false
+            try {
+                $sessionMutex = New-Object System.Threading.Mutex($false, (Get-ClipboardMutexName -Kind PlainTextSession))
+                $sessionHeld = $sessionMutex.WaitOne(0)
+            }
+            catch { $sessionMutex = $null }
+            try {
+                $deadline = (Get-Date).AddSeconds($Seconds)
+                $previous = Get-ClipboardSequenceNumber
+                while ((Get-Date) -lt $deadline) {
+                    if (Test-PlainTextStopRequested) { break }
+                    $current = Get-ClipboardSequenceNumber
+                    $rewriteLockHeld = $false
+                    try {
+                        $rewriteMutex = New-Object System.Threading.Mutex($false, (Get-ClipboardMutexName -Kind Rewrite))
+                        $gotRewrite = $rewriteMutex.WaitOne(0)
+                        $rewriteLockHeld = -not $gotRewrite
+                        if ($gotRewrite) { [void]$rewriteMutex.ReleaseMutex() }
+                        $rewriteMutex.Dispose()
+                    }
+                    catch { $rewriteLockHeld = $false }
+                    $observation = Invoke-PlainTextObservation -PreviousSequence $previous -CurrentSequence $current -Paused:$false -RewriteLockHeld:$rewriteLockHeld -Rewrite {
+                        Invoke-ClipboardPlainTextRewrite -WhatIf:$WhatIf
+                    }
+                    if ($null -ne $observation -and $observation.Activity) {
+                        $stateResult.State.lastActivityUtc = [DateTime]::UtcNow.ToString('o')
+                        [void](Save-ClipboardDiagnosticsState -State $stateResult.State)
+                    }
+                    if ($null -ne $observation -and $observation.Outcome -eq 'PASS') {
+                        Write-Host (Format-PlainTextConsoleLine -Result $observation)
+                        Write-PlainTextMetadataLog -Logger $logger -Level 'PASS' -EventId 1000 -Reason 'Rewritten' -Result $observation
+                        $notifier.Send('PASS', 'Clipboard plain-text rewrite', 'Rewritten')
+                        $rewriteCount++
+                        $stateResult.State.rewriteCountTotal = [int]$stateResult.State.rewriteCountTotal + 1
+                        $stateResult.State.lastRewriteUtc = [DateTime]::UtcNow.ToString('o')
+                        $stateResult.State.lastOutcome = 'PASS'
+                        $stateResult.State.lastReason = 'Rewritten'
+                        $stateResult.State.lastCharCount = [int]$observation.CharCount
+                        $stateResult.State.lastOwnerName = [string]$observation.SourceProcess
+                        [void](Save-ClipboardDiagnosticsState -State $stateResult.State)
+                    }
+                    elseif ($null -ne $observation -and $observation.Outcome -eq 'FAIL') {
+                        Write-Host ("FAIL {0} chars={1} source={2}" -f $observation.Reason, $observation.CharCount, $observation.SourceProcess)
+                        Write-PlainTextMetadataLog -Logger $logger -Level 'FAIL' -EventId 2000 -Reason $observation.Reason -Result $observation
+                        $toast = Get-ClipboardToastText -Level 'FAIL' -Reason $observation.Reason -CharCount ([int]$observation.CharCount)
+                        $notifier.Send('FAIL', $toast.Title, $toast.Body)
+                        $failCount++
+                    }
+                    elseif ($null -ne $observation -and $observation.Outcome -eq 'ERROR') {
+                        Write-Host ("ERROR {0}" -f $observation.Reason)
+                        Write-PlainTextMetadataLog -Logger $logger -Level 'ERROR' -EventId 3000 -Reason $observation.Reason -Result $observation
+                        $toast = Get-ClipboardToastText -Level 'ERROR' -Reason $observation.Reason -CharCount -1
+                        $notifier.Send('ERROR', $toast.Title, $toast.Body)
+                        $errorCount++
+                    }
+                    elseif ($null -ne $observation -and $observation.Outcome -eq 'WhatIf') {
+                        $before = @($observation.FormatsBefore) -join ', '
+                        Write-Host ("INFO -WhatIf would rewrite chars={0} formats={1} source={2}" -f $observation.CharCount, $before, $observation.SourceProcess)
+                    }
+                    if ($null -ne $observation -and @('PASS', 'FAIL', 'ERROR', 'WhatIf') -contains $observation.Outcome) {
+                        $events.Add([pscustomobject]@{
+                                time            = [DateTime]::UtcNow.ToString('o')
+                                outcome         = [string]$observation.Outcome
+                                reason          = [string]$observation.Reason
+                                charCount       = [int]$observation.CharCount
+                                formatsBefore   = @($observation.FormatsBefore)
+                                formatsAfter    = @($observation.FormatsAfter)
+                                sourceProcess   = [string]$observation.SourceProcess
+                                sequenceBefore  = [int64]$observation.SequenceBefore
+                                sequenceAfter   = [int64]$observation.SequenceAfter
+                            })
+                    }
+                    if ($null -ne $observation) { $previous = $current }
+                    Start-Sleep -Milliseconds $pollMs
+                }
+            }
+            finally {
+                if ($sessionHeld -and $null -ne $sessionMutex) {
+                    try { [void]$sessionMutex.ReleaseMutex() } catch { }
+                }
+                if ($null -ne $sessionMutex) { $sessionMutex.Dispose() }
+            }
+        }
+    }
+    if (-not $writeSummary) {
+        $script:Report.plainText = New-PlainTextReport -Seconds $Seconds -Events @() -RewriteCount 0 -FailCount 0 -ErrorCount $errorCount
+        $overlapCode = Get-PlainTextSessionExitCode -FailCount 0 -ErrorCount $errorCount -InvalidMode $false
+        if ($overlapCode -eq 2) { $script:HadError = $true }
+        return
+    }
+    if ($errorCount -gt 0) {
+        Write-PlainTextMetadataLog -Logger $logger -Level 'ERROR' -EventId 3000 -Reason 'SessionError' -Result $null
+    }
+    elseif ($failCount -gt 0) {
+        Write-PlainTextMetadataLog -Logger $logger -Level 'FAIL' -EventId 2001 -Reason 'SessionFail' -Result $null
+    }
+    else {
+        Write-PlainTextMetadataLog -Logger $logger -Level 'INFO' -EventId 1001 -Reason 'SessionClean' -Result $null
+    }
+    $script:Report.plainText = New-PlainTextReport -Seconds $Seconds -Events $events.ToArray() -RewriteCount $rewriteCount -FailCount $failCount -ErrorCount $errorCount
+    $code = Get-PlainTextSessionExitCode -FailCount $failCount -ErrorCount $errorCount -InvalidMode $false
+    if ($code -eq 2) { $script:HadError = $true }
+    elseif ($code -eq 1) { Add-Issue 'Plain-text rewrite reported one or more failures.' }
 }
 
 $selectedModes = @()
@@ -4286,19 +4494,21 @@ if ($Watch) { $selectedModes += 'Watch' }
 if ($TerminalPaste) { $selectedModes += 'TerminalPaste' }
 if ($BrowserTest) { $selectedModes += 'BrowserTest' }
 if ($BrowserPasteTest) { $selectedModes += 'BrowserPasteTest' }
+if ($PlainText) { $selectedModes += 'PlainText' }
 
+$runMode = Get-ClipboardRunMode -PlainText:$PlainText -Watch:$Watch -Fix:$Fix -ExportForCursor:$ExportForCursor -TerminalPaste:$TerminalPaste -BrowserTest:$BrowserTest -BrowserPasteTest:$BrowserPasteTest
 Write-Host "Windows Clipboard Diagnostics $($script:ToolVersion)" -ForegroundColor Cyan
-if ($selectedModes.Count -gt 1) {
-    Write-Host "ERROR: Choose one mode at a time: $($selectedModes -join ', ')." -ForegroundColor Red
+if ($runMode.ExitCode -eq 2) {
+    Write-Host "ERROR: Choose one mode at a time." -ForegroundColor Red
     exit 2
 }
-$mode = if ($selectedModes.Count -eq 1) { $selectedModes[0] } else { 'Diagnose' }
+$mode = $runMode.Mode
 $script:Report.mode = $mode
 Write-Host "Mode: $(if ($mode -eq 'Diagnose') { if ($Fix) { 'Diagnose + Fix' } else { 'Diagnose only' } } else { $mode })"
 if ($WhatIfPreference) {
     Write-Info "-WhatIf: changes are previewed, not performed."
 }
-if ($Fix -and $mode -ne 'Diagnose') {
+if ($Fix -and $mode -ne 'Diagnose' -and $mode -ne 'PlainText') {
     Write-WarnLine "-Fix only applies to the default diagnose mode; ignored for -$mode."
 }
 
@@ -4309,6 +4519,29 @@ try {
         'TerminalPaste' { Test-HostPrerequisites; Invoke-TerminalPasteDiagnosis }
         'BrowserTest' { Test-HostPrerequisites; Invoke-BrowserClipboardTest }
         'BrowserPasteTest' { Invoke-BrowserPasteTest }
+        'PlainText' {
+            $apartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
+            if ($apartment -eq [System.Threading.ApartmentState]::MTA -and -not $env:CLIPBOARD_PLAINTEXT_STA_CHILD) {
+                $env:CLIPBOARD_PLAINTEXT_STA_CHILD = '1'
+                $forward = New-Object System.Collections.Generic.List[string]
+                foreach ($key in $PSBoundParameters.Keys) {
+                    $bound = $PSBoundParameters[$key]
+                    if ($bound -is [System.Management.Automation.SwitchParameter]) {
+                        if ($bound) { $forward.Add("-$key") }
+                    }
+                    else {
+                        $forward.Add("-$key")
+                        $forward.Add([string]$bound)
+                    }
+                }
+                $relaunch = Get-StaRelaunchArguments -ScriptPath $PSCommandPath -Arguments $forward.ToArray()
+                $hostExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                if (-not (Test-Path -LiteralPath $hostExe)) { $hostExe = (Get-Command powershell).Source }
+                $child = Start-Process -FilePath $hostExe -ArgumentList $relaunch -Wait -PassThru -NoNewWindow
+                exit $child.ExitCode
+            }
+            Invoke-PlainTextSession -Seconds $Seconds -ShowText $ShowText.IsPresent -WhatIf:$WhatIfPreference
+        }
         default { Invoke-Diagnose }
     }
 }

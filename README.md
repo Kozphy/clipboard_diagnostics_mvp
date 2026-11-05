@@ -2,31 +2,36 @@
 
 Local, dependency-free PowerShell utility for diagnosing Windows clipboard problems. It tests clipboard text/image round-trips, checks known clipboard blockers, diagnoses terminal and browser paste paths, optionally repairs a PowerToys Mouse Without Borders setting, and exports clipboard images as a workaround for Cursor Agent on Windows.
 
-This repository is **not** a Cursor patch, installer, SaaS product, malware scanner, or cloud service.
+This repository is **not** a Cursor patch, installer, SaaS product, malware scanner, or cloud service. This repository is not a Cursor patch.
 
 ## Architecture
 
 ```
 clipboard_diagnostics_mvp/
-├── clipboard-test.ps1   # Single entrypoint for diagnostics and optional repair
+├── clipboard-core.ps1   # Shared rewrite, settings, logging, startup, and export
+├── clipboard-test.ps1   # Diagnostics and timed -PlainText
+├── clipboard-tray.ps1   # Always-on plain-text tray
 ├── README.md            # Usage, safety, troubleshooting, audit notes
 ├── LICENSE              # MIT (Kozphy, 2026)
 ├── .gitignore           # Ignores logs, reports/, output/, editor junk
 ├── tests/
-│   └── Run-Tests.ps1     # Dependency-free pure-helper tests
+│   ├── Run-Tests.ps1     # Diagnose-helper tests
+│   └── Run-CoreTests.ps1 # Core plain-text, tray, and export tests
 └── output/              # Created at runtime for exported PNGs (gitignored)
 ```
 
 | Component | Responsibility | Used by |
 |-----------|----------------|---------|
-| `clipboard-test.ps1` | All runtime behavior: tests, remediation, export, exit codes | Human operator / local shell |
+| `clipboard-core.ps1` | Rewrite rules, settings, logging, notifications, startup provider, export bundle | Both entrypoints |
+| `clipboard-test.ps1` | Diagnostics, remediation, image export, and timed `-PlainText` | Human operator / local shell |
+| `clipboard-tray.ps1` | Always-on rewrite, Health, Export Diagnostics, Start with Windows | Interactive desktop |
 | `.\output\` | Timestamped PNG exports for Cursor drag-and-drop | `-ExportForCursor` |
 | `.\reports\` and `.\backups\` | Optional diagnostic reports and settings backups | Default report / `-Fix` |
 | PowerToys MWB `settings.json` | External config read/optionally edited when `-Fix` runs | `-Fix` path only |
 
 **Control flow (verified in script):**
 
-1. `-ExportForCursor`, `-Watch`, `-TerminalPaste`, `-BrowserTest`, and `-BrowserPasteTest` each select a dedicated mode.
+1. `-PlainText`, `-ExportForCursor`, `-Watch`, `-TerminalPaste`, `-BrowserTest`, and `-BrowserPasteTest` each select a dedicated mode.
 2. Without a mode switch, run clipboard round-trips, known-blocker checks, editor checks, optional `-Fix` remediation, then show guidance and a summary.
 
 Exit codes: `0` no remaining issues, `1` remaining issues, `2` hard error (`$script:HadError`).
@@ -120,6 +125,34 @@ powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -ExportForCursor -
 
 **Idempotency:** each export creates a **new** timestamped file (`clipboard-for-cursor-yyyyMMdd-HHmmss.png` using local time). Prior PNGs are left in place.
 
+### Rewrite Edge Copilot HTML to plain text
+
+Omitting `-Seconds` uses default 120. The 10-minute session shown in the docs passes 600.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -PlainText -Seconds 600
+```
+
+`-PlainText` watches the clipboard for that many seconds and, when Edge or another Chromium app has copied HTML plus Unicode text, replaces the clipboard with Unicode text only. Cursor Agent can then Ctrl+V the text. Image and file-drop clipboards are left alone. PASS does not toast. FAIL and ERROR toast. The console, the JSON report, the file log, and the Event Log record character counts, format names, and the source process name. They do not contain clipboard text.
+
+### Always-on tray
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-tray.ps1
+```
+
+The tray menu has Pause / Resume, Health Status, Export Diagnostics, Start with Windows, and Quit. Pause is persisted under `%LOCALAPPDATA%\clipboard_diagnostics_mvp\settings.json` and is honored after reboot. Health Status and Export Diagnostics show metadata only. Export writes a zip only after you confirm the save dialog. Start with Windows registers the current-user logon task `\ClipboardDiagnosticsMvp\PlainTextTray`.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-tray.ps1 -InstallStartup
+powershell -ExecutionPolicy Bypass -File .\clipboard-tray.ps1 -UninstallStartup
+powershell -ExecutionPolicy Bypass -File .\clipboard-tray.ps1 -RegisterEventLog
+```
+
+`-InstallStartup` and `-UninstallStartup` do not open the tray icon. `-RegisterEventLog` must be re-run from an elevated Windows PowerShell when it prints the access-denied error. Rewrite still works without the Event Log source. PASS does not toast. FAIL and ERROR toast. Logs and the Event Log do not contain clipboard text.
+
+Local data reset: Quit, run `-UninstallStartup`, delete `%LOCALAPPDATA%\clipboard_diagnostics_mvp`, and delete the Start Menu shortcut `ClipboardDiagnosticsMvp.lnk` if toasts should stop.
+
 ## Results
 
 | Result | Meaning |
@@ -187,7 +220,11 @@ Evidence available for review: console transcript of the run; `.\output\*.png` t
 - **Single-script MVP** keeps install surface zero and makes behavior auditable in one file.  
 - **Export mode is isolated** from diagnose mode so round-trip tests cannot destroy a screenshot the user just copied for Cursor.  
 - **Regex settings patch** preferred over `ConvertTo-Json` round-trip on Windows PowerShell 5.1 to reduce risk of reformatting/secret field churn in PowerToys settings.  
-- **Not implemented:** patching Cursor, global hooks, background persistence, network telemetry, automated Advanced Paste disable.
+- **Not implemented:** patching Cursor, global hooks, network telemetry, and automated Advanced Paste disable. The tray is the supported background persistence.
+
+## Design / Roadmap
+
+The locked design for the plain-text tray is [docs/superpowers/specs/2026-11-05-plaintext-tray-design.md](docs/superpowers/specs/2026-11-05-plaintext-tray-design.md). The historical implementation plan is [docs/superpowers/plans/2026-11-05-plaintext-tray.md](docs/superpowers/plans/2026-11-05-plaintext-tray.md). Timed `-PlainText` and `clipboard-tray.ps1` are the shipped behavior described above. Omitting `-Seconds` uses default 120.
 
 ## Important limitation
 
