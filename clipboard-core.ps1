@@ -1470,3 +1470,63 @@ function Get-ClipboardHealthRows {
         Versions               = "clipboard-test.ps1 $ToolVersion; ClipboardCoreVersion $CoreVersion"
     }
 }
+
+function Sync-StartWithWindowsSetting {
+    param($SettingsResult, [bool]$TaskInstalled)
+    $settings = $SettingsResult.Settings
+    if ($SettingsResult.Unsupported) {
+        return [pscustomobject]@{ Changed = $false; Settings = $settings }
+    }
+    $current = $false
+    if ($null -ne $settings -and $null -ne $settings.startWithWindows) {
+        $current = [bool]$settings.startWithWindows
+    }
+    if ($current -eq $TaskInstalled) {
+        return [pscustomobject]@{ Changed = $false; Settings = $settings }
+    }
+    $settings.startWithWindows = [bool]$TaskInstalled
+    return [pscustomobject]@{ Changed = $true; Settings = $settings }
+}
+
+function ConvertFrom-StartupMethodResult {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Array]) {
+        if ($Value.Count -eq 0) { return $null }
+        return $Value[0]
+    }
+    return $Value
+}
+
+function Invoke-StartupToggle {
+    param($Provider, $SettingsResult, [bool]$Enable, [string]$Root)
+    $method = if ($Enable) { $Provider.Install } else { $Provider.Uninstall }
+    $raw = $method.Invoke()
+    $result = ConvertFrom-StartupMethodResult -Value $raw
+    $ok = $false
+    if ($null -ne $result -and $null -ne $result.PSObject.Properties['Ok']) {
+        $ok = [bool]$result.Ok
+    }
+    if (-not $ok) {
+        return [pscustomobject]@{ ExitCode = 2; TaskResult = 'error'; Saved = $false }
+    }
+    $taskResult = if ($Enable) { 'installed' } else { 'removed' }
+    if ($SettingsResult.Unsupported) {
+        return [pscustomobject]@{ ExitCode = 2; TaskResult = $taskResult; Saved = $false }
+    }
+    $SettingsResult.Settings.startWithWindows = [bool]$Enable
+    $saved = Save-ClipboardDiagnosticsSettings -Settings $SettingsResult.Settings -Root $Root
+    if ($saved) {
+        $logDirectory = Join-Path $Root 'logs'
+        $logger = New-LoggingProvider -LogDirectory $logDirectory -FileEnabled $true -EventLogEnabled $true
+        $eventId = if ($Enable) { 1104 } else { 1105 }
+        $reason = if ($Enable) { 'StartupInstalled' } else { 'StartupRemoved' }
+        $logger.Write(@{
+                Level   = 'INFO'
+                EventId = $eventId
+                Mode    = 'Tray'
+                Reason  = $reason
+            })
+    }
+    return [pscustomobject]@{ ExitCode = 0; TaskResult = $taskResult; Saved = [bool]$saved }
+}

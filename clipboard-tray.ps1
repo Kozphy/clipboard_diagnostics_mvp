@@ -44,8 +44,14 @@ if ($RegisterEventLog) {
     exit 2
 }
 if ($InstallStartup -or $UninstallStartup) {
-    Write-Host 'ERROR: startup toggle is not wired'
-    exit 2
+    $startupSettings = Read-ClipboardDiagnosticsSettings
+    $startupProvider = Get-StartupProvider -TrayScriptPath (Join-Path $script:TrayRoot 'clipboard-tray.ps1')
+    $startupToggle = Invoke-StartupToggle -Provider $startupProvider -SettingsResult $startupSettings -Enable:([bool]$InstallStartup) -Root (Get-ClipboardDiagnosticsRoot)
+    Write-Host $startupToggle.TaskResult
+    if ($startupToggle.ExitCode -eq 2 -and $startupSettings.Unsupported) {
+        Write-Host 'ERROR SettingsVersionUnsupported'
+    }
+    exit $startupToggle.ExitCode
 }
 
 $script:TrayMutexName = 'Local\ClipboardDiagnosticsMvp.Tray'
@@ -98,8 +104,15 @@ function Update-ClipboardTrayIcon {
 }
 
 function Get-TrayStartupInstalled {
-    # Task 7 replaces this stub. Do not register a Scheduled Task from the tray yet.
-    return $false
+    if ($null -eq $script:StartupProvider) { return $false }
+    try {
+        $status = ConvertFrom-StartupMethodResult -Value $script:StartupProvider.GetStatus.Invoke()
+        if ($null -eq $status -or $null -eq $status.PSObject.Properties['Installed']) { return $false }
+        return [bool]$status.Installed
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-TrayHealthRows {
@@ -327,6 +340,12 @@ $gate = Get-ClipboardRuntimeGate -SettingsResult $script:SettingsResult -StateRe
 $script:Paused = [bool]$gate.PausedEffective
 $script:LastSequence = Get-ClipboardSequenceNumber
 $script:TrayLogger.Write(@{ Level = 'INFO'; EventId = 1100; Mode = 'Tray'; Reason = 'Started' })
+$script:StartupProvider = Get-StartupProvider -TrayScriptPath (Join-Path $script:TrayRoot 'clipboard-tray.ps1')
+$script:StartupInstalled = Get-TrayStartupInstalled
+$startupSync = Sync-StartWithWindowsSetting -SettingsResult $script:SettingsResult -TaskInstalled $script:StartupInstalled
+if ($startupSync.Changed -and -not $script:SettingsResult.Unsupported) {
+    [void](Save-ClipboardDiagnosticsSettings -Settings $startupSync.Settings)
+}
 
 $script:TrayNotifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:TrayBitmap = $null
@@ -336,7 +355,8 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $script:PauseMenuItem = $menu.Items.Add($(if ($script:Paused) { 'Resume' } else { 'Pause' }))
 [void]$menu.Items.Add('Health Status…')
 [void]$menu.Items.Add('Export Diagnostics…')
-[void]$menu.Items.Add('Start with Windows')
+$script:StartupMenuItem = $menu.Items.Add('Start with Windows')
+$script:StartupMenuItem.Checked = [bool]$script:StartupInstalled
 [void]$menu.Items.Add('Quit')
 $script:PauseMenuItem.Add_Click({
         if ($script:StoreUnsupported) { return }
@@ -355,7 +375,10 @@ $menu.Items[2].Add_Click({
         [void][System.Windows.Forms.MessageBox]::Show('Export Diagnostics arrives in a later task. No zip was written.', 'Clipboard diagnostics')
     })
 $menu.Items[3].Add_Click({
-        [void][System.Windows.Forms.MessageBox]::Show('ERROR: startup toggle is not wired', 'Clipboard diagnostics')
+        $enable = -not [bool]$script:StartupMenuItem.Checked
+        [void](Invoke-StartupToggle -Provider $script:StartupProvider -SettingsResult $script:SettingsResult -Enable:$enable -Root (Get-ClipboardDiagnosticsRoot))
+        $script:StartupInstalled = Get-TrayStartupInstalled
+        $script:StartupMenuItem.Checked = [bool]$script:StartupInstalled
     })
 $menu.Items[4].Add_Click({ Stop-ClipboardTray })
 $script:TrayNotifyIcon.ContextMenuStrip = $menu

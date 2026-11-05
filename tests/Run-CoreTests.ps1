@@ -464,6 +464,49 @@ try {
         Assert-Equal 'False' $status.Managed 'status not managed'
         Assert-True ($provider.Id -ne 'Policy') 'no policy provider'
     }
+    Invoke-Test 'startup sync and toggle honor an unsupported settings file' {
+        $root = Join-Path $scratch 'startup'
+        $ready = Read-ClipboardDiagnosticsSettings -Root $root
+        $synced = Sync-StartWithWindowsSetting -SettingsResult $ready -TaskInstalled $true
+        Assert-Equal 'True' $synced.Changed 'task installs the flag'
+        Assert-Equal 'True' $synced.Settings.startWithWindows 'flag true'
+        $same = Sync-StartWithWindowsSetting -SettingsResult (Read-ClipboardDiagnosticsSettings -Root $root) -TaskInstalled $false
+        Assert-Equal 'False' $same.Changed 'unsaved disk copy is still false while the task is absent'
+        $again = Sync-StartWithWindowsSetting -SettingsResult $ready -TaskInstalled $true
+        Assert-Equal 'False' $again.Changed 'second sync of the mutated object is stable'
+        $ver = Join-Path $scratch 'startup-ver'
+        [void][System.IO.Directory]::CreateDirectory($ver)
+        [System.IO.File]::WriteAllText((Join-Path $ver 'settings.json'), '{"version":2,"paused":false,"startWithWindows":false}')
+        $before = [System.IO.File]::ReadAllText((Join-Path $ver 'settings.json'))
+        $newer = Read-ClipboardDiagnosticsSettings -Root $ver
+        $blocked = Sync-StartWithWindowsSetting -SettingsResult $newer -TaskInstalled $true
+        Assert-Equal 'False' $blocked.Changed 'unsupported does not save'
+        $calls = New-Object System.Collections.Generic.List[string]
+        $provider = Get-StartupProvider -TrayScriptPath 'C:\Program Files\clipboard_diagnostics_mvp\clipboard-tray.ps1' -TaskBackend {
+            param($Operation, $Spec) $script:ToggleOps.Add($Operation)
+            return [pscustomobject]@{ Ok = $true; Installed = ($Operation -eq 'Install' -or $Operation -eq 'Query'); LastTaskResult = 0; ActionPath = $Spec.ActionPath }
+        }
+        $script:ToggleOps = $calls
+        $done = Invoke-StartupToggle -Provider $provider -SettingsResult $newer -Enable $true -Root $ver
+        Assert-Equal 2 $done.ExitCode 'unsupported settings exit 2'
+        Assert-Equal 'installed' $done.TaskResult 'task still installed'
+        Assert-Equal 'False' $done.Saved 'file not saved'
+        Assert-Equal 'Install' $calls[0] 'backend install ran'
+        Assert-Equal $before ([System.IO.File]::ReadAllText((Join-Path $ver 'settings.json'))) 'version 2 bytes kept'
+        $ok = Invoke-StartupToggle -Provider $provider -SettingsResult $ready -Enable $false -Root $root
+        Assert-Equal 0 $ok.ExitCode 'supported uninstall'
+        Assert-Equal 'removed' $ok.TaskResult 'removed'
+        Assert-Equal 'True' $ok.Saved 'saved'
+        Assert-Equal 'False' (Read-ClipboardDiagnosticsSettings -Root $root).Settings.startWithWindows 'flag cleared'
+    }
+    Invoke-Test 'uninstall does not delete the toast shortcut' {
+        $tray = Join-Path (Split-Path -Parent $CorePath) 'clipboard-tray.ps1'
+        $text = [System.IO.File]::ReadAllText($tray)
+        Assert-True ($text -match 'InstallStartup') 'install switch'
+        Assert-True ($text -match 'UninstallStartup') 'uninstall switch'
+        Assert-True ($text -match 'Start with Windows') 'menu label'
+        Assert-True ($text -notmatch 'ClipboardDiagnosticsMvp\.lnk') 'tray does not delete the shortcut'
+    }
     Invoke-Test 'tooltip and health rows are metadata' {
         Assert-Equal 'Clipboard diagnostics: Running' (Get-ClipboardTrayTooltip -Paused $false) 'running tip'
         Assert-Equal 'Clipboard diagnostics: Paused' (Get-ClipboardTrayTooltip -Paused $true) 'paused tip'
