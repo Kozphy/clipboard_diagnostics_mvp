@@ -1399,3 +1399,74 @@ function Get-StartupProvider {
     }
     return $provider
 }
+
+function Get-ClipboardTrayTooltip {
+    param([bool]$Paused)
+    if ($Paused) { return 'Clipboard diagnostics: Paused' }
+    return 'Clipboard diagnostics: Running'
+}
+
+function Format-ClipboardHealthInstant {
+    param($Value)
+    if ($null -eq $Value) { return 'never' }
+    $instant = [datetime]$Value
+    if ($instant -eq [datetime]::MinValue) { return 'never' }
+    if ($instant.Kind -eq [System.DateTimeKind]::Utc) { $instant = $instant.ToLocalTime() }
+    return $instant.ToString('yyyy-MM-dd HH:mm:ss')
+}
+
+function Get-ClipboardHealthRows {
+    param(
+        [bool]$Paused,
+        [string]$ListenerMode,
+        [int]$PollIntervalMs,
+        [bool]$StartWithWindows,
+        [AllowEmptyString()][string]$TaskAction,
+        $SessionRewrites,
+        $TotalRewrites,
+        $LastActivityUtc,
+        $LastRewriteUtc,
+        $LastOutcome,
+        $LastReason,
+        $LastCharCount,
+        $LastOwnerName,
+        [bool]$EventLogReady,
+        [bool]$PolicyPresent,
+        [string]$ToolVersion,
+        [string]$CoreVersion
+    )
+    $listener = 'Clipboard listener'
+    if ($ListenerMode -eq 'Poll') { $listener = "Polling every $PollIntervalMs ms" }
+    $action = 'not installed'
+    if (-not [string]::IsNullOrWhiteSpace($TaskAction)) { $action = $TaskAction }
+    $resultText = 'none'
+    if ($null -ne $LastOutcome -and -not [string]::IsNullOrWhiteSpace([string]$LastOutcome)) {
+        $resultText = ('{0} {1}' -f $LastOutcome, $LastReason).Trim()
+    }
+    $countText = 'n/a'
+    if ($null -ne $LastCharCount -and -not [string]::IsNullOrWhiteSpace([string]$LastCharCount)) {
+        $countText = [string]$LastCharCount
+    }
+    $ownerText = 'n/a'
+    if ($null -ne $LastOwnerName -and -not [string]::IsNullOrWhiteSpace([string]$LastOwnerName)) {
+        $ownerText = [string]$LastOwnerName
+    }
+    [ordered]@{
+        Status                 = $(if ($Paused) { 'Paused' } else { 'Running' })
+        Listener               = $listener
+        'Start with Windows'   = $(if ($StartWithWindows) { 'Yes' } else { 'No' })
+        Task                   = '\ClipboardDiagnosticsMvp\PlainTextTray'
+        'Task action'          = $action
+        'Session rewrites'     = [string]$SessionRewrites
+        'Total rewrites'       = [string]$TotalRewrites
+        'Last activity'        = (Format-ClipboardHealthInstant -Value $LastActivityUtc)
+        'Last rewrite'         = (Format-ClipboardHealthInstant -Value $LastRewriteUtc)
+        'Last result'          = $resultText
+        'Last character count' = $countText
+        'Last source process'  = $ownerText
+        'Event Log'            = $(if ($EventLogReady) { 'registered' } else { 'not registered' })
+        Policy                 = $(if ($PolicyPresent) { 'present (not applied)' } else { 'none' })
+        'Log folder'           = '%LOCALAPPDATA%\clipboard_diagnostics_mvp\logs'
+        Versions               = "clipboard-test.ps1 $ToolVersion; ClipboardCoreVersion $CoreVersion"
+    }
+}

@@ -464,6 +464,49 @@ try {
         Assert-Equal 'False' $status.Managed 'status not managed'
         Assert-True ($provider.Id -ne 'Policy') 'no policy provider'
     }
+    Invoke-Test 'tooltip and health rows are metadata' {
+        Assert-Equal 'Clipboard diagnostics: Running' (Get-ClipboardTrayTooltip -Paused $false) 'running tip'
+        Assert-Equal 'Clipboard diagnostics: Paused' (Get-ClipboardTrayTooltip -Paused $true) 'paused tip'
+        Assert-True ((Get-ClipboardTrayTooltip -Paused $false).Length -le 63) 'tip length'
+        $rows = Get-ClipboardHealthRows -Paused $false -ListenerMode 'Listener' -PollIntervalMs 400 -StartWithWindows $true -TaskAction '' -SessionRewrites 2 -TotalRewrites 9 -LastActivityUtc $null -LastRewriteUtc $null -LastOutcome $null -LastReason $null -LastCharCount $null -LastOwnerName $null -EventLogReady $false -PolicyPresent $false -ToolVersion '3.0.0' -CoreVersion '1.0.0'
+        Assert-Equal 'Running' $rows.Status 'status'
+        Assert-Equal 'Clipboard listener' $rows.Listener 'listener'
+        Assert-Equal 'Yes' $rows['Start with Windows'] 'startup'
+        Assert-Equal '\ClipboardDiagnosticsMvp\PlainTextTray' $rows.Task 'task'
+        Assert-Equal 'not installed' $rows['Task action'] 'missing action'
+        Assert-Equal '2' $rows['Session rewrites'] 'session'
+        Assert-Equal '9' $rows['Total rewrites'] 'total'
+        Assert-Equal 'never' $rows['Last activity'] 'activity'
+        Assert-Equal 'never' $rows['Last rewrite'] 'rewrite'
+        Assert-Equal 'none' $rows['Last result'] 'result'
+        Assert-Equal 'n/a' $rows['Last character count'] 'chars'
+        Assert-Equal 'n/a' $rows['Last source process'] 'process'
+        Assert-Equal 'not registered' $rows['Event Log'] 'event log'
+        Assert-Equal 'none' $rows.Policy 'policy'
+        Assert-True ($rows.Versions -match '3\.0\.0') 'tool version'
+        Assert-True ($rows.Versions -match '1\.0\.0') 'core version'
+        $poll = Get-ClipboardHealthRows -Paused $true -ListenerMode 'Poll' -PollIntervalMs 400 -StartWithWindows $false -TaskAction 'C:\tray.ps1' -SessionRewrites 0 -TotalRewrites 0 -LastActivityUtc ([datetime]'2026-11-05T12:00:00Z') -LastRewriteUtc $null -LastOutcome 'FAIL' -LastReason 'OpenFailed' -LastCharCount -1 -LastOwnerName 'msedge' -EventLogReady $true -PolicyPresent $true -ToolVersion '3.0.0' -CoreVersion '1.0.0'
+        Assert-Equal 'Paused' $poll.Status 'paused'
+        Assert-Equal 'Polling every 400 ms' $poll.Listener 'poll label'
+        Assert-Equal 'No' $poll['Start with Windows'] 'off'
+        Assert-Equal 'FAIL OpenFailed' $poll['Last result'] 'result pair'
+        Assert-Equal '-1' $poll['Last character count'] 'count'
+        Assert-Equal 'msedge' $poll['Last source process'] 'owner'
+        Assert-Equal 'registered' $poll['Event Log'] 'registered'
+        Assert-Equal 'present (not applied)' $poll.Policy 'policy present'
+        Assert-True ((ConvertTo-Json $poll) -notmatch 'COPILOT-SECRET-PHRASE') 'no payload slot'
+    }
+    Invoke-Test 'tray script has no balloon and registers the event source switch' {
+        $tray = Join-Path (Split-Path -Parent $CorePath) 'clipboard-tray.ps1'
+        $text = [System.IO.File]::ReadAllText($tray)
+        Assert-True ($text -notmatch 'ShowBalloonTip') 'no balloon'
+        Assert-True ($text -notmatch '\.ico') 'no icon file'
+        Assert-True ($text -match 'Clipboard diagnostics — Health') 'health title'
+        Assert-True ($text -match 'Tray already running\.') 'second instance line'
+        Assert-True ($text -match 'RegisterEventLog') 'event log switch'
+        Assert-True ($text -match 'Local\\ClipboardDiagnosticsMvp\.Tray') 'tray mutex'
+        Assert-True ($text -match 'Quit') 'quit item'
+    }
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
