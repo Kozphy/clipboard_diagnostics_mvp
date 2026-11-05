@@ -598,6 +598,422 @@ function Publish-ClipboardStoreEvents {
     }
 }
 
+function Test-ClipboardNeedsPlainText {
+    param(
+        [string[]]$FormatNames = @(),
+        [bool]$HasExtractableText = $false
+    )
+    $names = @($FormatNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($names.Count -eq 0) {
+        return [pscustomobject]@{ NeedsRewrite = $false; Reason = 'EmptyClipboard' }
+    }
+    $protected = @(
+        'CF_BITMAP', 'CF_DIB', 'CF_DIBV5', 'CF_TIFF', 'CF_HDROP', 'CF_ENHMETAFILE', 'CF_METAFILEPICT',
+        'Bitmap', 'System.Drawing.Bitmap', 'DeviceIndependentBitmap', 'Format17',
+        'FileDrop', 'FileName', 'FileNameW', 'PNG', 'image/png'
+    )
+    $triggers = @('HTML Format', 'text/html', 'Chromium Web Custom MIME Data Format')
+    $isProtected = $false
+    $isTrigger = $false
+    foreach ($name in $names) {
+        foreach ($item in $protected) {
+            if ([string]::Equals($name, $item, [System.StringComparison]::OrdinalIgnoreCase)) { $isProtected = $true }
+        }
+        foreach ($item in $triggers) {
+            if ([string]::Equals($name, $item, [System.StringComparison]::OrdinalIgnoreCase)) { $isTrigger = $true }
+        }
+    }
+    if ($isProtected) { return [pscustomobject]@{ NeedsRewrite = $false; Reason = 'ProtectedFormat' } }
+    if ($isTrigger -and -not $HasExtractableText) { return [pscustomobject]@{ NeedsRewrite = $false; Reason = 'NoExtractableText' } }
+    if ($isTrigger -and $HasExtractableText) { return [pscustomobject]@{ NeedsRewrite = $true; Reason = 'NeedsRewrite' } }
+    return [pscustomobject]@{ NeedsRewrite = $false; Reason = 'AlreadyPlain' }
+}
+
+function ConvertFrom-HtmlCharacterReferences {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    $decoded = [regex]::Replace($Text, '&#x([0-9A-Fa-f]+);', {
+            param($match)
+            [string]([char][Convert]::ToInt32($match.Groups[1].Value, 16))
+        })
+    $decoded = [regex]::Replace($decoded, '&#(\d+);', {
+            param($match)
+            [string]([char][int]$match.Groups[1].Value)
+        })
+    $decoded = $decoded.Replace('&lt;', '<').Replace('&gt;', '>').Replace('&quot;', '"').Replace('&apos;', "'").Replace('&nbsp;', ' ').Replace('&amp;', '&')
+    return $decoded.Replace([string]([char]0x00A0), ' ')
+}
+
+function ConvertFrom-ClipboardHtmlBytes {
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '' }
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $decoded = $utf8.GetString($Bytes)
+    $slice = $null
+    $startMatch = [regex]::Match($decoded, 'StartFragment:(\d+)')
+    $endMatch = [regex]::Match($decoded, 'EndFragment:(\d+)')
+    if ($startMatch.Success -and $endMatch.Success) {
+        $start = 0
+        $end = 0
+        $startOk = [int]::TryParse($startMatch.Groups[1].Value, [ref]$start)
+        $endOk = [int]::TryParse($endMatch.Groups[1].Value, [ref]$end)
+        if ($startOk -and $endOk -and $end -gt $start -and $start -ge 0 -and $end -le $Bytes.Length) {
+            $slice = $utf8.GetString($Bytes, $start, $end - $start)
+        }
+    }
+    if ([string]::IsNullOrEmpty($slice)) {
+        $marker = [regex]::Match($decoded, '(?s)<!--StartFragment-->(.*)<!--EndFragment-->')
+        if ($marker.Success) { $slice = $marker.Groups[1].Value }
+    }
+    if ([string]::IsNullOrEmpty($slice)) {
+        $markup = $decoded.IndexOf('<')
+        $slice = if ($markup -ge 0) { $decoded.Substring($markup) } else { $decoded }
+    }
+    $slice = [regex]::Replace($slice, '(?is)<script[^>]*>.*?</script>', '')
+    $slice = [regex]::Replace($slice, '(?is)<style[^>]*>.*?</style>', '')
+    $slice = [regex]::Replace($slice, '(?s)<[^>]+>', '')
+    return (ConvertFrom-HtmlCharacterReferences -Text $slice).Trim()
+}
+
+function Select-ClipboardPlainText {
+    param(
+        [AllowNull()][string]$UnicodeText,
+        [AllowNull()][byte[]]$HtmlFormatBytes,
+        [AllowNull()][byte[]]$TextHtmlBytes
+    )
+    if ($null -ne $UnicodeText -and $UnicodeText.Trim().Length -gt 0) {
+        return [pscustomobject]@{ Text = [string]$UnicodeText; Source = 'UnicodeText' }
+    }
+    foreach ($candidate in @($HtmlFormatBytes, $TextHtmlBytes)) {
+        if ($null -eq $candidate) { continue }
+        $derived = ConvertFrom-ClipboardHtmlBytes -Bytes $candidate
+        if (-not [string]::IsNullOrWhiteSpace($derived)) {
+            return [pscustomobject]@{ Text = $derived; Source = 'Html' }
+        }
+    }
+    return [pscustomobject]@{ Text = $null; Source = 'None' }
+}
+
+function New-ClipboardRewriteResult {
+    param(
+        $Outcome,
+        $Reason,
+        $CharCount,
+        $FormatsBefore,
+        $FormatsAfter,
+        $SourceProcess,
+        $SequenceBefore,
+        $SequenceAfter
+    )
+    [pscustomobject]@{
+        Outcome         = [string]$Outcome
+        Reason          = [string]$Reason
+        CharCount       = [int]$CharCount
+        FormatsBefore   = @($FormatsBefore)
+        FormatsAfter    = @($FormatsAfter)
+        SourceProcess   = [string]$SourceProcess
+        SequenceBefore  = [int64]$SequenceBefore
+        SequenceAfter   = [int64]$SequenceAfter
+    }
+}
+
+function Reset-ClipboardRewriteLoopState {
+    $script:PlainTextRewritePasses = New-Object System.Collections.Generic.List[object]
+    $script:PlainTextSuppressUntil = $null
+}
+
+function Initialize-ClipboardPlainTextNative {
+    if ($script:ClipboardPlainTextNativeReady) { return $true }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        if (-not ('ClipDiagCore.Native' -as [type])) {
+            $source = @'
+using System;
+using System.Runtime.InteropServices;
+namespace ClipDiagCore {
+    public static class Native {
+        [DllImport("user32.dll")]
+        public static extern uint GetClipboardSequenceNumber();
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetClipboardOwner();
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    }
+}
+'@
+            Add-Type -TypeDefinition $source -ErrorAction Stop
+        }
+        $script:ClipboardPlainTextNativeReady = $true
+        return $true
+    }
+    catch {
+        $script:ClipboardPlainTextNativeReady = $false
+        return $false
+    }
+}
+
+function Get-ClipboardSequenceNumber {
+    if (-not (Initialize-ClipboardPlainTextNative)) { return [uint32]0 }
+    try { return [uint32][ClipDiagCore.Native]::GetClipboardSequenceNumber() }
+    catch { return [uint32]0 }
+}
+
+function Get-ClipboardPlainTextSnapshot {
+    $empty = [pscustomobject]@{
+        Opened          = $false
+        FormatNames     = @()
+        UnicodeText     = $null
+        HtmlFormatBytes = $null
+        TextHtmlBytes   = $null
+        SourceProcess   = ''
+        Sequence        = [uint32]0
+    }
+    if (-not (Initialize-ClipboardPlainTextNative)) { return $empty }
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $data = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            $data = [System.Windows.Forms.Clipboard]::GetDataObject()
+            break
+        }
+        catch {
+            if ($attempt -lt 10) { Start-Sleep -Milliseconds 50 }
+        }
+    }
+    if ($null -eq $data) { return $empty }
+    $formats = @($data.GetFormats())
+    $unicode = $null
+    try {
+        if ($data.GetDataPresent([System.Windows.Forms.DataFormats]::UnicodeText)) {
+            $unicode = [string]$data.GetData([System.Windows.Forms.DataFormats]::UnicodeText)
+        }
+    }
+    catch { }
+    $htmlBytes = $null
+    $textHtmlBytes = $null
+    foreach ($pair in @(
+            @{ Name = 'HTML Format'; Target = 'html' },
+            @{ Name = 'text/html'; Target = 'texthtml' }
+        )) {
+        try {
+            if (-not $data.GetDataPresent($pair.Name)) { continue }
+            $raw = $data.GetData($pair.Name)
+            $asBytes = $null
+            if ($raw -is [byte[]]) { $asBytes = $raw }
+            elseif ($null -ne $raw) { $asBytes = $utf8.GetBytes([string]$raw) }
+            if ($pair.Target -eq 'html') { $htmlBytes = $asBytes } else { $textHtmlBytes = $asBytes }
+        }
+        catch { }
+    }
+    $processName = ''
+    $sequence = [uint32]0
+    try {
+        $sequence = [uint32][ClipDiagCore.Native]::GetClipboardSequenceNumber()
+        $owner = [ClipDiagCore.Native]::GetClipboardOwner()
+        $ownerProcessId = [uint32]0
+        [void][ClipDiagCore.Native]::GetWindowThreadProcessId($owner, [ref]$ownerProcessId)
+        if ($ownerProcessId -gt 0) {
+            $processName = (Get-Process -Id ([int]$ownerProcessId) -ErrorAction Stop).ProcessName
+        }
+    }
+    catch { }
+    return [pscustomobject]@{
+        Opened          = $true
+        FormatNames     = $formats
+        UnicodeText     = $unicode
+        HtmlFormatBytes = $htmlBytes
+        TextHtmlBytes   = $textHtmlBytes
+        SourceProcess   = $processName
+        Sequence        = $sequence
+    }
+}
+
+function Set-ClipboardUnicodeOnly {
+    param([AllowNull()][string]$Text)
+    $failed = [pscustomobject]@{ UnicodeText = $null; Sequence = [uint32]0; FormatNames = @() }
+    if (-not (Initialize-ClipboardPlainTextNative)) { return $failed }
+    try {
+        $obj = New-Object System.Windows.Forms.DataObject
+        $obj.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $Text)
+        [System.Windows.Forms.Clipboard]::SetDataObject($obj, $true, 10, 50)
+    }
+    catch {
+        return $failed
+    }
+    $readBack = Get-ClipboardPlainTextSnapshot
+    return [pscustomobject]@{
+        UnicodeText = $readBack.UnicodeText
+        Sequence    = $readBack.Sequence
+        FormatNames = @($readBack.FormatNames)
+    }
+}
+
+function Invoke-ClipboardPlainTextRewrite {
+    param(
+        [switch]$WhatIf,
+        [scriptblock]$ReadSnapshot,
+        [scriptblock]$WriteUnicodeText,
+        [datetime]$Now
+    )
+    if ($Now -eq [datetime]::MinValue -or $PSBoundParameters.ContainsKey('Now') -eq $false) {
+        if (-not $PSBoundParameters.ContainsKey('Now')) { $Now = Get-Date }
+    }
+    if ($null -eq $script:PlainTextRewritePasses) { Reset-ClipboardRewriteLoopState }
+    if ($null -ne $script:PlainTextSuppressUntil -and $Now -lt $script:PlainTextSuppressUntil) {
+        return New-ClipboardRewriteResult -Outcome 'FAIL' -Reason 'RewriteLoopSuppressed' -CharCount -1 -FormatsBefore @() -FormatsAfter @() -SourceProcess '' -SequenceBefore 0 -SequenceAfter 0
+    }
+    if ($null -eq $ReadSnapshot) { $ReadSnapshot = { Get-ClipboardPlainTextSnapshot } }
+    $snap = & $ReadSnapshot
+    if (-not $snap.Opened) {
+        $sourceName = ''
+        $sequence = [int64]0
+        if ($null -ne $snap.SourceProcess) { $sourceName = [string]$snap.SourceProcess }
+        if ($null -ne $snap.Sequence) { $sequence = [int64]$snap.Sequence }
+        return New-ClipboardRewriteResult -Outcome 'FAIL' -Reason 'OpenFailed' -CharCount -1 -FormatsBefore @() -FormatsAfter @() -SourceProcess $sourceName -SequenceBefore $sequence -SequenceAfter $sequence
+    }
+    $selected = Select-ClipboardPlainText -UnicodeText $snap.UnicodeText -HtmlFormatBytes $snap.HtmlFormatBytes -TextHtmlBytes $snap.TextHtmlBytes
+    $hasText = $null -ne $selected.Text
+    $decision = Test-ClipboardNeedsPlainText -FormatNames @($snap.FormatNames) -HasExtractableText $hasText
+    if (-not $decision.NeedsRewrite) {
+        $outcome = if ($decision.Reason -eq 'NoExtractableText') { 'FAIL' } else { 'Skip' }
+        $count = if ($decision.Reason -eq 'NoExtractableText') { 0 } else { -1 }
+        return New-ClipboardRewriteResult -Outcome $outcome -Reason $decision.Reason -CharCount $count -FormatsBefore @($snap.FormatNames) -FormatsAfter @() -SourceProcess $snap.SourceProcess -SequenceBefore $snap.Sequence -SequenceAfter $snap.Sequence
+    }
+    if ($WhatIf) {
+        return New-ClipboardRewriteResult -Outcome 'WhatIf' -Reason 'NeedsRewrite' -CharCount $selected.Text.Length -FormatsBefore @($snap.FormatNames) -FormatsAfter @() -SourceProcess $snap.SourceProcess -SequenceBefore $snap.Sequence -SequenceAfter $snap.Sequence
+    }
+    if ($null -eq $WriteUnicodeText) { $WriteUnicodeText = { param($Text) Set-ClipboardUnicodeOnly -Text $Text } }
+    $written = & $WriteUnicodeText $selected.Text
+    $matched = ($null -ne $written.UnicodeText -and $written.UnicodeText -ceq $selected.Text -and [int64]$written.Sequence -ne [int64]$snap.Sequence)
+    if (-not $matched) {
+        $written = & $WriteUnicodeText $selected.Text
+        $matched = ($null -ne $written.UnicodeText -and $written.UnicodeText -ceq $selected.Text -and [int64]$written.Sequence -ne [int64]$snap.Sequence)
+    }
+    if (-not $matched) {
+        return New-ClipboardRewriteResult -Outcome 'FAIL' -Reason 'ReadBackMismatch' -CharCount $selected.Text.Length -FormatsBefore @($snap.FormatNames) -FormatsAfter @($written.FormatNames) -SourceProcess $snap.SourceProcess -SequenceBefore $snap.Sequence -SequenceAfter $written.Sequence
+    }
+    $result = New-ClipboardRewriteResult -Outcome 'PASS' -Reason 'Rewritten' -CharCount $selected.Text.Length -FormatsBefore @($snap.FormatNames) -FormatsAfter @($written.FormatNames) -SourceProcess $snap.SourceProcess -SequenceBefore $snap.Sequence -SequenceAfter $written.Sequence
+    $script:PlainTextRewritePasses.Add([pscustomobject]@{ Time = $Now; CharCount = $selected.Text.Length })
+    $recent = @($script:PlainTextRewritePasses | Where-Object {
+            $_.CharCount -eq $selected.Text.Length -and ($Now - $_.Time).TotalSeconds -ge 0 -and ($Now - $_.Time).TotalSeconds -le 2
+        })
+    if ($recent.Count -ge 3) {
+        $script:PlainTextSuppressUntil = $Now.AddSeconds(10)
+    }
+    return $result
+}
+
+function Get-ClipboardRunMode {
+    param(
+        [bool]$PlainText,
+        [bool]$Watch,
+        [bool]$Fix,
+        [bool]$ExportForCursor,
+        [bool]$TerminalPaste,
+        [bool]$BrowserTest,
+        [bool]$BrowserPasteTest
+    )
+    $modes = New-Object System.Collections.Generic.List[string]
+    if ($ExportForCursor) { $modes.Add('ExportForCursor') }
+    if ($Watch) { $modes.Add('Watch') }
+    if ($TerminalPaste) { $modes.Add('TerminalPaste') }
+    if ($BrowserTest) { $modes.Add('BrowserTest') }
+    if ($BrowserPasteTest) { $modes.Add('BrowserPasteTest') }
+    if ($PlainText) { $modes.Add('PlainText') }
+    if ($PlainText -and ($Fix -or $modes.Count -gt 1)) {
+        return [pscustomobject]@{ Mode = 'PlainText'; ExitCode = 2 }
+    }
+    if ($modes.Count -gt 1) {
+        return [pscustomobject]@{ Mode = $modes[0]; ExitCode = 2 }
+    }
+    if ($modes.Count -eq 1) {
+        return [pscustomobject]@{ Mode = $modes[0]; ExitCode = 0 }
+    }
+    return [pscustomobject]@{ Mode = 'Diagnose'; ExitCode = 0 }
+}
+
+function Get-PlainTextSessionExitCode {
+    param(
+        [int]$FailCount,
+        [int]$ErrorCount,
+        [bool]$InvalidMode
+    )
+    if ($InvalidMode -or $ErrorCount -gt 0) { return 2 }
+    if ($FailCount -gt 0) { return 1 }
+    return 0
+}
+
+function New-PlainTextReport {
+    param(
+        [int]$Seconds,
+        $Events,
+        [int]$RewriteCount,
+        [int]$FailCount,
+        [int]$ErrorCount
+    )
+    [pscustomobject]@{
+        mode         = 'PlainText'
+        seconds      = $Seconds
+        rewriteCount = $RewriteCount
+        failCount    = $FailCount
+        errorCount   = $ErrorCount
+        events       = @($Events)
+    }
+}
+
+function Format-PlainTextConsoleLine {
+    param($Result)
+    $before = @($Result.FormatsBefore) -join ', '
+    $after = @($Result.FormatsAfter) -join ', '
+    return "PASS rewrote clipboard chars=$($Result.CharCount) formats=$before -> $after source=$($Result.SourceProcess)"
+}
+
+function Get-ClipboardMutexName {
+    param([Parameter(Mandatory = $true)][ValidateSet('Tray', 'Rewrite', 'PlainTextSession')][string]$Kind)
+    switch ($Kind) {
+        'Tray' { return 'Local\ClipboardDiagnosticsMvp.Tray' }
+        'Rewrite' { return 'Local\ClipboardDiagnosticsMvp.Rewrite' }
+        'PlainTextSession' { return 'Local\ClipboardDiagnosticsMvp.PlainTextSession' }
+    }
+    return $null
+}
+
+function Invoke-PlainTextObservation {
+    param(
+        $PreviousSequence,
+        $CurrentSequence,
+        [bool]$Paused,
+        [bool]$RewriteLockHeld,
+        [scriptblock]$Rewrite
+    )
+    if ([uint64]$PreviousSequence -eq [uint64]$CurrentSequence) { return $null }
+    if ($Paused) {
+        return [pscustomobject]@{ Outcome = 'Skip'; Reason = 'Paused'; Activity = $true }
+    }
+    if ($RewriteLockHeld) {
+        return [pscustomobject]@{ Outcome = 'Dropped'; Reason = 'RewriteLockHeld'; Activity = $true }
+    }
+    $result = & $Rewrite
+    if ($null -eq $result) {
+        return [pscustomobject]@{ Outcome = 'Skip'; Reason = 'AlreadyPlain'; Activity = $true }
+    }
+    $result | Add-Member -NotePropertyName Activity -NotePropertyValue $true -Force
+    return $result
+}
+
+function Get-StaRelaunchArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [string[]]$Arguments = @()
+    )
+    $rendered = @($Arguments | ForEach-Object {
+            if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
+        }) -join ' '
+    $suffix = ''
+    if (-not [string]::IsNullOrWhiteSpace($rendered)) { $suffix = ' ' + $rendered }
+    return "-NoProfile -STA -ExecutionPolicy Bypass -File `"$ScriptPath`"$suffix"
+}
+
 function ConvertTo-ToastXmlText {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
