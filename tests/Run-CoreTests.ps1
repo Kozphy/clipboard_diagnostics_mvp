@@ -603,6 +603,18 @@ try {
         Assert-True $threw 'forbidden Text field rejected'
         Assert-True (-not (Test-Path (Join-Path $scratch 'bad.zip'))) 'no zip after rejection'
     }
+    Invoke-Test 'README documents the 600 second plain-text example' {
+        $readme = Join-Path (Split-Path -Parent $CorePath) 'README.md'
+        $text = [System.IO.File]::ReadAllText($readme)
+        Assert-True ($text -match 'clipboard-test\.ps1 -PlainText -Seconds 600') '600 second example'
+        Assert-True ($text -match 'default 120') 'default still documented'
+        Assert-True ($text -match 'clipboard-tray\.ps1') 'tray usage'
+        Assert-True ($text -match '-RegisterEventLog') 'elevation note'
+        Assert-True ($text -match 'clipboard-core\.ps1') 'architecture lists the core'
+        Assert-True ($text -match '2026-11-05-plaintext-tray-design\.md') 'design link remains'
+        Assert-True ($text -match 'not a Cursor patch') 'safety wording remains'
+        Assert-True ($text -match 'does not prove malware') 'malware wording remains'
+    }
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
