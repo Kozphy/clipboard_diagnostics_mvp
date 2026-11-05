@@ -544,7 +544,11 @@ try {
         $text = [System.IO.File]::ReadAllText($tray)
         Assert-True ($text -notmatch 'ShowBalloonTip') 'no balloon'
         Assert-True ($text -notmatch '\.ico') 'no icon file'
-        Assert-True ($text -match 'Clipboard diagnostics — Health') 'health title'
+        # This file is UTF-8 without a BOM. Windows PowerShell 5.1 decodes that
+        # with the ANSI code page, so a literal em dash in the pattern is not
+        # U+2014. ReadAllText still returns the tray title's real em dash.
+        $healthTitle = [string]::Concat('Clipboard diagnostics ', [char]0x2014, ' Health')
+        Assert-True ($text.Contains($healthTitle)) 'health title'
         Assert-True ($text -match 'Tray already running\.') 'second instance line'
         Assert-True ($text -match 'RegisterEventLog') 'event log switch'
         Assert-True ($text -match 'Local\\ClipboardDiagnosticsMvp\.Tray') 'tray mutex'
@@ -585,7 +589,8 @@ try {
             Assert-True ($readme -match 'no clipboard text') 'readme privacy line'
             Assert-True ($readme -match 'ClipboardDiagnosticsMvp\\PlainTextTray') 'task name in readme'
             $statusJson = (New-Object System.IO.StreamReader($zip.GetEntry('status.json').Open())).ReadToEnd()
-            Assert-True ($statusJson -match '"policyApplied": false' -or $statusJson -match '"policyApplied":false') 'policy not applied'
+            # 5.1 ConvertTo-Json writes two spaces after the colon; 7 writes one.
+            Assert-True ($statusJson -match '"policyApplied"\s*:\s*false\b') 'policy not applied'
             Assert-True ($statusJson -notmatch 'ComputerName') 'no computer name field'
             Assert-True ($statusJson -notmatch [regex]::Escape($secret)) 'secret absent from status'
             $logBytes = 0
