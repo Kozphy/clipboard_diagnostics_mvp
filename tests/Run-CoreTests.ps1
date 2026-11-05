@@ -135,6 +135,64 @@ try {
         $def = ${function:Read-ClipboardPolicyKeyDefault}.ToString()
         Assert-True ($def.IndexOf('HKLM') -ge 0 -and $def.IndexOf('HKLM') -lt $def.IndexOf('HKCU')) 'default reader checks HKLM first'
     }
+    Invoke-Test 'Format-OperationalMessage emits the PASS metadata line' {
+        $line = Format-OperationalMessage -Fields @{
+            Level = 'PASS'; EventId = 1000; Mode = 'Tray'; Process = 'msedge'; Pid = 4123
+            FormatsBefore = @('HTML Format', 'CF_UNICODETEXT', 'Chromium Web Custom MIME Data Format')
+            FormatsAfter = @('CF_UNICODETEXT', 'CF_TEXT'); CharCount = 842; Sequence = 101; Reason = 'Rewritten'
+        }
+        Assert-Equal 'level=PASS eventId=1000 mode=Tray process=msedge pid=4123 formatsBefore=HTML Format|CF_UNICODETEXT|Chromium Web Custom MIME Data Format formatsAfter=CF_UNICODETEXT|CF_TEXT charCount=842 sequence=101 reason=Rewritten' $line 'exact body'
+    }
+    Invoke-Test 'Format-OperationalMessage rejects clipboard fields and sanitizes reason' {
+        $threwText = $false
+        try { Format-OperationalMessage -Fields @{ Level = 'PASS'; EventId = 1000; Mode = 'Tray'; Text = 'secret' } } catch { $threwText = $true }
+        Assert-True $threwText 'Text rejected'
+        $threwHtml = $false
+        try { Format-OperationalMessage -Fields @{ Level = 'PASS'; EventId = 1000; Mode = 'Tray'; Html = '<b>x</b>' } } catch { $threwHtml = $true }
+        Assert-True $threwHtml 'Html rejected'
+        $line = Format-OperationalMessage -Fields @{
+            Level = 'FAIL'; EventId = 2000; Mode = 'Timed'; Process = 'msedge'; Reason = "one`nline"; FormatsBefore = @('a|b')
+        }
+        Assert-True ($line -match 'reason=one line') 'newline becomes space'
+        Assert-True ($line -match 'formatsBefore=a/b') 'pipe in a format name becomes slash'
+        $threwPath = $false
+        try { Format-OperationalMessage -Fields @{ Level = 'PASS'; EventId = 1000; Mode = 'Tray'; Process = 'C:\Windows\msedge.exe' } } catch { $threwPath = $true }
+        Assert-True $threwPath 'process path rejected'
+    }
+    Invoke-Test 'file log rotates and the ring stays at 20 without a payload' {
+        $dir = Join-Path $scratch 'logs'
+        $writes = New-Object System.Collections.Generic.List[object]
+        $logger = New-LoggingProvider -LogDirectory $dir -FileEnabled $true -EventLogEnabled $true -RotateBytes 80 -EventLogWriter {
+            param($EntryType, $EventId, $Message) $writes.Add([pscustomobject]@{ EntryType = $EntryType; EventId = $EventId; Message = $Message })
+        }
+        $secret = 'COPILOT-SECRET-PHRASE'
+        for ($i = 1; $i -le 21; $i++) {
+            $logger.Write(@{ Level = 'PASS'; EventId = 1000; Mode = 'Tray'; Process = 'msedge'; CharCount = $i; Reason = 'Rewritten' })
+        }
+        Assert-Equal 20 @($logger.Ring).Count 'ring cap'
+        Assert-Equal 21 $logger.Ring[-1].CharCount 'newest kept'
+        $raw = Get-ChildItem -LiteralPath $dir -Filter 'operational*.log' | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }
+        $joined = $raw -join "`n"
+        Assert-True ($joined -notmatch [regex]::Escape($secret)) 'secret absent from logs'
+        Assert-True ($joined -match 'level=PASS') 'pass line stored'
+        Assert-True (@(Get-ChildItem -LiteralPath $dir -Filter 'operational-*.log').Count -ge 1) 'rotation renamed a file'
+        Assert-Equal 21 $writes.Count 'event writer saw every record'
+        Assert-Equal 1000 $writes[0].EventId 'event id preserved'
+        Assert-True ($writes[0].Message -notmatch 'T00') 'event message has no timestamp prefix'
+    }
+    Invoke-Test 'disabled sinks still fill the ring and store flags publish once' {
+        $dir = Join-Path $scratch 'silent-logs'
+        $logger = New-LoggingProvider -LogDirectory $dir -FileEnabled $false -EventLogEnabled $false -EventLogWriter { throw 'should not be called' }
+        $logger.Write(@{ Level = 'INFO'; EventId = 1107; Mode = 'Tray'; Reason = 'SettingsClamped' })
+        Assert-Equal 1 @($logger.Ring).Count 'ring records when sinks are off'
+        Assert-True (-not (Test-Path (Join-Path $dir 'operational.log'))) 'file sink off'
+        $root = Join-Path $scratch 'clamp-log'
+        [void][System.IO.Directory]::CreateDirectory($root)
+        [System.IO.File]::WriteAllText((Join-Path $root 'settings.json'), '{"version":1,"plainText":{"pollIntervalMs":50}}')
+        $settings = Read-ClipboardDiagnosticsSettings -Root $root
+        Publish-ClipboardStoreEvents -SettingsResult $settings -StateResult (Read-ClipboardDiagnosticsState -Root $root) -Logger $logger
+        Assert-True (@($logger.Ring | Where-Object { $_.Reason -eq 'SettingsClamped' -and $_.EventId -eq 1107 }).Count -ge 1) 'clamp event'
+    }
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue

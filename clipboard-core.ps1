@@ -379,3 +379,221 @@ function Get-ClipboardPolicySignal {
     }
     return Resolve-ClipboardPolicySignal -HklmNames $hklmNames -HkcuNames $hkcuNames
 }
+
+function ConvertTo-OperationalToken {
+    param($Value)
+    if ($null -eq $Value) {
+        return ''
+    }
+    $text = [string]$Value
+    $text = $text.Replace("`r", ' ').Replace("`n", ' ')
+    return $text.Replace('|', '/')
+}
+
+function Format-OperationalMessage {
+    param([Parameter(Mandatory = $true)][hashtable]$Fields)
+    $allowed = @('Level', 'EventId', 'Mode', 'Process', 'Pid', 'FormatsBefore', 'FormatsAfter', 'CharCount', 'Sequence', 'Reason')
+    foreach ($key in @($Fields.Keys)) {
+        if ($allowed -notcontains [string]$key) {
+            throw "Operational log field not allowed: $key"
+        }
+    }
+    foreach ($required in @('Level', 'EventId', 'Mode')) {
+        if (-not $Fields.ContainsKey($required)) {
+            throw "Operational log field missing: $required"
+        }
+    }
+    $process = ''
+    if ($Fields.ContainsKey('Process') -and $null -ne $Fields['Process']) {
+        $process = [string]$Fields['Process']
+    }
+    if ($process.IndexOf('\') -ge 0 -or $process.IndexOf('/') -ge 0) {
+        throw 'Process must be a process name, not a path'
+    }
+    $before = @()
+    if ($Fields.ContainsKey('FormatsBefore') -and $null -ne $Fields['FormatsBefore']) {
+        $before = @($Fields['FormatsBefore'] | ForEach-Object { ConvertTo-OperationalToken $_ })
+    }
+    $after = @()
+    if ($Fields.ContainsKey('FormatsAfter') -and $null -ne $Fields['FormatsAfter']) {
+        $after = @($Fields['FormatsAfter'] | ForEach-Object { ConvertTo-OperationalToken $_ })
+    }
+    $charCount = -1
+    if ($Fields.ContainsKey('CharCount') -and $null -ne $Fields['CharCount']) {
+        $charCount = [int]$Fields['CharCount']
+    }
+    $processId = 0
+    if ($Fields.ContainsKey('Pid') -and $null -ne $Fields['Pid']) {
+        $processId = [int]$Fields['Pid']
+    }
+    $sequence = [int64]0
+    if ($Fields.ContainsKey('Sequence') -and $null -ne $Fields['Sequence']) {
+        $sequence = [int64]$Fields['Sequence']
+    }
+    $reason = ''
+    if ($Fields.ContainsKey('Reason') -and $null -ne $Fields['Reason']) {
+        $reason = ConvertTo-OperationalToken $Fields['Reason']
+    }
+    return ('level={0} eventId={1} mode={2} process={3} pid={4} formatsBefore={5} formatsAfter={6} charCount={7} sequence={8} reason={9}' -f `
+            (ConvertTo-OperationalToken $Fields['Level']), `
+            [int]$Fields['EventId'], `
+            (ConvertTo-OperationalToken $Fields['Mode']), `
+            (ConvertTo-OperationalToken $process), `
+            $processId, `
+            ($before -join '|'), `
+            ($after -join '|'), `
+            $charCount, `
+            $sequence, `
+            $reason)
+}
+
+function Get-ClipboardEventEntryType {
+    param([int]$EventId)
+    if ($EventId -ge 2000 -and $EventId -le 2001) {
+        return 'Warning'
+    }
+    if ($EventId -ge 3000 -and $EventId -le 3002) {
+        return 'Error'
+    }
+    return 'Information'
+}
+
+function Test-ClipboardEventLogSource {
+    try {
+        return [bool][System.Diagnostics.EventLog]::SourceExists('ClipboardDiagnosticsMvp')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Initialize-ClipboardEventLog {
+    try {
+        if (Test-ClipboardEventLogSource) {
+            return [pscustomobject]@{ Ready = $true; Status = 'registered' }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Ready = $false; Status = 'unavailable' }
+    }
+    try {
+        New-EventLog -LogName Application -Source 'ClipboardDiagnosticsMvp' -ErrorAction Stop
+    }
+    catch {
+        return [pscustomobject]@{ Ready = $false; Status = 'unavailable' }
+    }
+    try {
+        if (Test-ClipboardEventLogSource) {
+            return [pscustomobject]@{ Ready = $true; Status = 'registered' }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Ready = $false; Status = 'unavailable' }
+    }
+    return [pscustomobject]@{ Ready = $false; Status = 'unavailable' }
+}
+
+function New-LoggingProvider {
+    param(
+        [string]$LogDirectory,
+        [bool]$FileEnabled = $true,
+        [bool]$EventLogEnabled = $true,
+        [scriptblock]$EventLogWriter,
+        [int]$RotateBytes = 1048576
+    )
+    $logger = [pscustomobject]@{
+        Ring            = New-Object 'System.Collections.Generic.List[pscustomobject]'
+        FileEnabled     = [bool]$FileEnabled
+        EventLogEnabled = [bool]$EventLogEnabled
+        LogDirectory    = $LogDirectory
+        RotateBytes     = $RotateBytes
+        EventLogWriter  = $EventLogWriter
+    }
+    $logger | Add-Member -MemberType ScriptMethod -Name Write -Value {
+        param($Fields)
+        $body = Format-OperationalMessage -Fields $Fields
+        $record = [ordered]@{
+            Level          = $null
+            EventId        = $null
+            Mode           = $null
+            Process        = $null
+            Pid            = $null
+            FormatsBefore  = $null
+            FormatsAfter   = $null
+            CharCount      = $null
+            Sequence       = $null
+            Reason         = $null
+        }
+        foreach ($key in @($Fields.Keys)) {
+            $record[$key] = $Fields[$key]
+        }
+        $this.Ring.Add([pscustomobject]$record)
+        while ($this.Ring.Count -gt 20) {
+            $this.Ring.RemoveAt(0)
+        }
+        if ($this.FileEnabled) {
+            [void][System.IO.Directory]::CreateDirectory($this.LogDirectory)
+            $path = Join-Path $this.LogDirectory 'operational.log'
+            $stamp = [DateTime]::UtcNow.ToString('o')
+            $utf8 = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::AppendAllText($path, ("{0} {1}`n" -f $stamp, $body), $utf8)
+            if ((Get-Item -LiteralPath $path).Length -ge [int64]$this.RotateBytes) {
+                $nameStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
+                $rotated = Join-Path $this.LogDirectory ("operational-{0}.log" -f $nameStamp)
+                $suffix = 0
+                while (Test-Path -LiteralPath $rotated) {
+                    $suffix++
+                    $rotated = Join-Path $this.LogDirectory ("operational-{0}-{1}.log" -f $nameStamp, $suffix)
+                }
+                [System.IO.File]::Move($path, $rotated)
+                $rotatedFiles = @(Get-ChildItem -LiteralPath $this.LogDirectory -Filter 'operational-*.log' | Sort-Object LastWriteTimeUtc -Descending)
+                for ($index = 5; $index -lt $rotatedFiles.Count; $index++) {
+                    Remove-Item -LiteralPath $rotatedFiles[$index].FullName -Force
+                }
+            }
+        }
+        if ($this.EventLogEnabled) {
+            $entryType = Get-ClipboardEventEntryType -EventId ([int]$Fields['EventId'])
+            if ($null -ne $this.EventLogWriter) {
+                & $this.EventLogWriter $entryType ([int]$Fields['EventId']) $body
+            }
+            elseif (Test-ClipboardEventLogSource) {
+                Write-EventLog -LogName Application -Source 'ClipboardDiagnosticsMvp' -EventId ([int]$Fields['EventId']) -EntryType $entryType -Message $body
+            }
+        }
+    }
+    return $logger
+}
+
+function Publish-ClipboardStoreEvents {
+    param($SettingsResult, $StateResult, $Logger)
+    $sent = @{}
+    $emit = {
+        param($Level, $EventId, $Reason)
+        if ($sent.ContainsKey($Reason)) {
+            return
+        }
+        $sent[$Reason] = $true
+        $Logger.Write(@{
+                Level   = $Level
+                EventId = $EventId
+                Mode    = 'Store'
+                Reason  = $Reason
+            })
+    }
+    if ($null -ne $SettingsResult -and $SettingsResult.Corrupt) {
+        & $emit 'ERROR' 3001 'SettingsCorrupt'
+    }
+    if ($null -ne $SettingsResult -and $SettingsResult.Unsupported) {
+        & $emit 'ERROR' 3001 'SettingsVersionUnsupported'
+    }
+    if ($null -ne $StateResult -and $StateResult.Corrupt) {
+        & $emit 'ERROR' 3001 'StateCorrupt'
+    }
+    if ($null -ne $StateResult -and $StateResult.Unsupported) {
+        & $emit 'ERROR' 3001 'SettingsVersionUnsupported'
+    }
+    if ($null -ne $SettingsResult -and $SettingsResult.Clamped) {
+        & $emit 'INFO' 1107 'SettingsClamped'
+    }
+}
