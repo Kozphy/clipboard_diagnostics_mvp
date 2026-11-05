@@ -193,6 +193,53 @@ try {
         Publish-ClipboardStoreEvents -SettingsResult $settings -StateResult (Read-ClipboardDiagnosticsState -Root $root) -Logger $logger
         Assert-True (@($logger.Ring | Where-Object { $_.Reason -eq 'SettingsClamped' -and $_.EventId -eq 1107 }).Count -ge 1) 'clamp event'
     }
+    Invoke-Test 'toast text is metadata and ReadBackMismatch uses the verify body' {
+        $fail = Get-ClipboardToastText -Level 'FAIL' -Reason 'OpenFailed' -CharCount -1
+        Assert-Equal 'Clipboard plain-text rewrite failed' $fail.Title 'fail title'
+        Assert-Equal 'Could not rewrite the clipboard (OpenFailed). The clipboard was left unchanged. Characters available: -1.' $fail.Body 'open failed body'
+        $mismatch = Get-ClipboardToastText -Level 'FAIL' -Reason 'ReadBackMismatch' -CharCount 12
+        Assert-Equal 'Clipboard rewrite could not be verified (ReadBackMismatch). Rich formats were not restored.' $mismatch.Body 'mismatch body'
+        $err = Get-ClipboardToastText -Level 'ERROR' -Reason 'Exception IOException' -CharCount -1
+        Assert-Equal 'Clipboard diagnostics error' $err.Title 'error title'
+        Assert-Equal 'Plain-text helper hit an error (Exception IOException). See the operational log.' $err.Body 'error body'
+        $xml = ConvertTo-ToastXml -Title 'A & B' -Body '1 < 2'
+        Assert-True ($xml -match 'ToastText02') 'template'
+        Assert-True ($xml -match 'A &amp; B') 'title escaped'
+        Assert-True ($xml -match '1 &lt; 2') 'body escaped'
+        Assert-True ($xml -notmatch '1 < 2') 'raw less-than absent'
+        $args = Get-ClipboardToastLaunchArguments -TrayScriptPath 'C:\Program Files\clipboard_diagnostics_mvp\clipboard-tray.ps1'
+        Assert-True ($args -match '-File "C:\\Program Files\\clipboard_diagnostics_mvp\\clipboard-tray.ps1"') 'path with spaces is quoted'
+    }
+    Invoke-Test 'Toast provider drops PASS and INFO and sends FAIL once per call' {
+        $sent = New-Object System.Collections.Generic.List[string]
+        $toast = New-NotificationProvider -Kind Toast -ToastOnFail $true -ToastSender { param($Xml) $sent.Add($Xml) }
+        $toast.Send('PASS', 'ignored', 'ignored')
+        $toast.Send('INFO', 'ignored', 'ignored')
+        $fail = Get-ClipboardToastText -Level 'FAIL' -Reason 'NoExtractableText' -CharCount 0
+        $toast.Send('FAIL', $fail.Title, $fail.Body)
+        Assert-Equal 1 $sent.Count 'only the fail was built'
+        Assert-Equal 0 @($toast.Sent | Where-Object { $_.Level -eq 'PASS' }).Count 'sent list has no pass toast'
+        $silent = New-NotificationProvider -Kind Silent -ToastOnFail $true -ToastSender { throw 'silent must not send' }
+        $silent.Send('FAIL', $fail.Title, $fail.Body)
+        Assert-Equal 0 @($silent.Sent).Count 'silent sends nothing'
+        $off = New-NotificationProvider -Kind Toast -ToastOnFail $false -ToastSender { throw 'toastOnFail false' }
+        $off.Send('ERROR', 'Clipboard diagnostics error', 'body')
+        Assert-Equal 0 @($off.Sent).Count 'toastOnFail false suppresses FAIL and ERROR'
+    }
+    Invoke-Test 'toast infrastructure failure is recorded once per provider' {
+        $failures = 0
+        $attempts = 0
+        $toast = New-NotificationProvider -Kind Toast -ToastOnFail $true -ToastSender {
+            param($Xml) $script:ToastAttempts++; throw 'winrt down'
+        } -FailureLogger { param($Message) $script:ToastFailureLogs++ }
+        $script:ToastAttempts = 0
+        $script:ToastFailureLogs = 0
+        $toast.Send('FAIL', 'Clipboard plain-text rewrite failed', 'Could not rewrite the clipboard (OpenFailed). The clipboard was left unchanged. Characters available: -1.')
+        $toast.Send('FAIL', 'Clipboard plain-text rewrite failed', 'Could not rewrite the clipboard (OpenFailed). The clipboard was left unchanged. Characters available: -1.')
+        Assert-Equal 2 $script:ToastAttempts 'later sends still try'
+        Assert-Equal 1 $script:ToastFailureLogs 'one failure log'
+        Assert-Equal 1 $toast.ToastFailures 'counter stays at one'
+    }
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue

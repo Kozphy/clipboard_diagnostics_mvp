@@ -597,3 +597,225 @@ function Publish-ClipboardStoreEvents {
         & $emit 'INFO' 1107 'SettingsClamped'
     }
 }
+
+function ConvertTo-ToastXmlText {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return $Text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;')
+}
+
+function Get-ClipboardToastText {
+    param(
+        [string]$Level,
+        [string]$Reason,
+        [int]$CharCount
+    )
+    if ($Level -eq 'ERROR') {
+        return [pscustomobject]@{
+            Title = 'Clipboard diagnostics error'
+            Body  = "Plain-text helper hit an error ($Reason). See the operational log."
+        }
+    }
+    $title = 'Clipboard plain-text rewrite failed'
+    if ($Reason -eq 'ReadBackMismatch') {
+        $body = "Clipboard rewrite could not be verified ($Reason). Rich formats were not restored."
+    }
+    else {
+        $body = "Could not rewrite the clipboard ($Reason). The clipboard was left unchanged. Characters available: $CharCount."
+    }
+    return [pscustomobject]@{
+        Title = $title
+        Body  = $body
+    }
+}
+
+function ConvertTo-ToastXml {
+    param(
+        [string]$Title,
+        [string]$Body
+    )
+    $safeTitle = ConvertTo-ToastXmlText -Text $Title
+    $safeBody = ConvertTo-ToastXmlText -Text $Body
+    return ('<toast><visual><binding template="ToastText02"><text id="1">{0}</text><text id="2">{1}</text></binding></visual></toast>' -f $safeTitle, $safeBody)
+}
+
+function Get-ClipboardToastLaunchArguments {
+    param([Parameter(Mandatory = $true)][string]$TrayScriptPath)
+    return "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TrayScriptPath`""
+}
+
+function Get-ClipboardToastShortcutPath {
+    Join-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') 'ClipboardDiagnosticsMvp.lnk'
+}
+
+function Set-ClipboardToastAppUserModelId {
+    param(
+        [Parameter(Mandatory = $true)][string]$LinkPath,
+        [Parameter(Mandatory = $true)][string]$AppUserModelId
+    )
+    if (-not ('ClipboardToastLink' -as [type])) {
+        $source = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ClipboardToastLink {
+    public static void SetAppId(string linkPath, string appId) {
+        IPersistFile file = (IPersistFile)new CShellLink();
+        file.Load(linkPath, 0);
+        IPropertyStore store = (IPropertyStore)file;
+        PropertyKey key = new PropertyKey();
+        key.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+        key.pid = 5;
+        PropVariant value = new PropVariant();
+        value.SetString(appId);
+        store.SetValue(ref key, ref value);
+        store.Commit();
+        file.Save(linkPath, true);
+    }
+
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    private class CShellLink { }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("0000010b-0000-0000-C000-000000000046")]
+    private interface IPersistFile {
+        void GetClassID(out Guid pClassID);
+        [PreserveSig] int IsDirty();
+        void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
+        void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, bool fRemember);
+        void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
+        void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
+    }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+    private interface IPropertyStore {
+        void GetCount(out uint cProps);
+        void GetAt(uint iProp, out PropertyKey pkey);
+        void GetValue(ref PropertyKey key, out PropVariant pv);
+        void SetValue(ref PropertyKey key, ref PropVariant pv);
+        void Commit();
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct PropertyKey {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct PropVariant {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr pointer;
+        public void SetString(string value) {
+            vt = 31;
+            pointer = Marshal.StringToCoTaskMemUni(value);
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+    }
+    [ClipboardToastLink]::SetAppId($LinkPath, $AppUserModelId)
+}
+
+function Send-ClipboardDefaultToast {
+    param([Parameter(Mandatory = $true)][string]$Xml)
+    if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        throw 'Toast shortcut is unavailable because APPDATA is not set.'
+    }
+    $shortcutPath = Get-ClipboardToastShortcutPath
+    $programs = Split-Path -Parent $shortcutPath
+    if (-not (Test-Path -LiteralPath $programs)) {
+        [void][System.IO.Directory]::CreateDirectory($programs)
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershellExe)) {
+        $found = Get-Command powershell -ErrorAction SilentlyContinue
+        if ($null -eq $found) {
+            throw 'powershell.exe was not found for the toast shortcut.'
+        }
+        $powershellExe = $found.Source
+    }
+    $shortcut.TargetPath = $powershellExe
+    $shortcut.Description = 'ClipboardDiagnosticsMvp.PlainText'
+    $shortcut.Save()
+    Set-ClipboardToastAppUserModelId -LinkPath $shortcutPath -AppUserModelId 'ClipboardDiagnosticsMvp.PlainText'
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+    $document = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $document.LoadXml($Xml)
+    $notification = [Windows.UI.Notifications.ToastNotification]::new($document)
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('ClipboardDiagnosticsMvp.PlainText').Show($notification)
+}
+
+function Write-ClipboardToastUnavailable {
+    param([string]$Message)
+    try {
+        $directory = Join-Path (Get-ClipboardDiagnosticsRoot) 'logs'
+        $logger = New-LoggingProvider -LogDirectory $directory -FileEnabled $true -EventLogEnabled $true
+        $logger.Write(@{
+                Level   = 'ERROR'
+                EventId = 3002
+                Mode    = 'Toast'
+                Reason  = 'ToastUnavailable'
+            })
+    }
+    catch {
+        return
+    }
+}
+
+function New-NotificationProvider {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Toast', 'Silent')]
+        [string]$Kind,
+        [bool]$ToastOnFail = $true,
+        [scriptblock]$ToastSender,
+        [scriptblock]$FailureLogger
+    )
+    if ($null -eq $FailureLogger) {
+        $FailureLogger = { param($Message) Write-ClipboardToastUnavailable -Message $Message }
+    }
+    $provider = [pscustomobject]@{
+        Kind           = $Kind
+        ToastOnFail    = [bool]$ToastOnFail
+        ToastSender    = $ToastSender
+        FailureLogger  = $FailureLogger
+        Sent           = New-Object 'System.Collections.Generic.List[pscustomobject]'
+        ToastFailures  = 0
+        Attempts       = 0
+    }
+    $provider | Add-Member -MemberType ScriptMethod -Name Send -Value {
+        param($Level, $Title, $Message)
+        if ($this.Kind -eq 'Silent') { return }
+        if ($Level -eq 'PASS' -or $Level -eq 'INFO') { return }
+        if (-not $this.ToastOnFail) { return }
+        if ($Level -ne 'FAIL' -and $Level -ne 'ERROR') { return }
+        $this.Attempts = [int]$this.Attempts + 1
+        $xml = ConvertTo-ToastXml -Title $Title -Body $Message
+        try {
+            if ($null -eq $this.ToastSender) {
+                Send-ClipboardDefaultToast -Xml $xml
+            }
+            else {
+                & $this.ToastSender $xml
+            }
+            $this.Sent.Add([pscustomobject]@{
+                    Level   = $Level
+                    Title   = $Title
+                    Message = $Message
+                })
+        }
+        catch {
+            if ([int]$this.ToastFailures -lt 1) {
+                $this.ToastFailures = 1
+                if ($null -ne $this.FailureLogger) {
+                    & $this.FailureLogger $_.Exception.Message
+                }
+            }
+        }
+    }
+    return $provider
+}
