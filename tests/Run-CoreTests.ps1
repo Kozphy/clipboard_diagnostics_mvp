@@ -550,6 +550,59 @@ try {
         Assert-True ($text -match 'Local\\ClipboardDiagnosticsMvp\.Tray') 'tray mutex'
         Assert-True ($text -match 'Quit') 'quit item'
     }
+    Invoke-Test 'export zip has metadata only and caps logs' {
+        Assert-Equal 'clipboard-diagnostics-export-20261105-120000.zip' (Get-ClipboardExportFileName -Now ([datetime]'2026-11-05T12:00:00')) 'file name'
+        $root = Join-Path $scratch 'export'
+        $settings = Read-ClipboardDiagnosticsSettings -Root $root
+        $state = Read-ClipboardDiagnosticsState -Root $root
+        $logDir = Join-Path $root 'logs'
+        [void][System.IO.Directory]::CreateDirectory($logDir)
+        $secret = 'COPILOT-SECRET-PHRASE'
+        [System.IO.File]::WriteAllText((Join-Path $logDir 'operational.log'), ('x' * 40))
+        [System.IO.File]::WriteAllText((Join-Path $logDir 'operational-20261105T000000000Z.log'), ('y' * 40))
+        [System.IO.File]::WriteAllText((Join-Path $root 'reports-should-not-copy.txt'), $secret)
+        $status = [pscustomobject]@{
+            status = 'Running'; listener = 'Clipboard listener'; startWithWindows = 'No'
+            task = '\ClipboardDiagnosticsMvp\PlainTextTray'; taskAction = 'not installed'
+            sessionRewrites = 0; totalRewrites = 0; lastActivity = 'never'; lastRewrite = 'never'
+            lastResult = 'none'; lastCharCount = 'n/a'; lastSourceProcess = 'n/a'
+            eventLog = 'not registered'; policy = 'none'
+            logFolder = (Join-Path $root 'logs'); toolVersion = '3.0.0'; coreVersion = '1.0.0'
+            exportedAtUtc = '2026-11-05T12:00:00.0000000Z'; psVersion = '5.1'; osCaption = 'Microsoft Windows 11 Pro'
+            policyPresent = $false; policyApplied = $false; eventLogStatus = 'not registered'
+        }
+        $dest = Join-Path $scratch 'out.zip'
+        Export-ClipboardDiagnosticsBundle -DestinationPath $dest -Root $root -Status $status -Ring @(@{ Level = 'PASS'; EventId = 1000; Reason = 'Rewritten'; CharCount = 3 }) -MaxLogBytes 32 -StagingParent (Join-Path $scratch 'stage')
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($dest)
+        try {
+            $names = @($zip.Entries | ForEach-Object { $_.FullName })
+            foreach ($required in @('README.txt','status.json','settings.json','state.json','recent-memory.json')) {
+                Assert-True ($names -contains $required) "entry $required"
+            }
+            Assert-True ($names -notcontains 'reports-should-not-copy.txt') 'repo reports are not bundled'
+            $readme = (New-Object System.IO.StreamReader($zip.GetEntry('README.txt').Open())).ReadToEnd()
+            Assert-True ($readme -match 'no clipboard text') 'readme privacy line'
+            Assert-True ($readme -match 'ClipboardDiagnosticsMvp\\PlainTextTray') 'task name in readme'
+            $statusJson = (New-Object System.IO.StreamReader($zip.GetEntry('status.json').Open())).ReadToEnd()
+            Assert-True ($statusJson -match '"policyApplied": false' -or $statusJson -match '"policyApplied":false') 'policy not applied'
+            Assert-True ($statusJson -notmatch 'ComputerName') 'no computer name field'
+            Assert-True ($statusJson -notmatch [regex]::Escape($secret)) 'secret absent from status'
+            $logBytes = 0
+            foreach ($entry in $zip.Entries) {
+                if ($entry.FullName -like 'logs/*') { $logBytes += $entry.Length }
+            }
+            Assert-True ($logBytes -le 32) 'log cap'
+        }
+        finally { $zip.Dispose() }
+        Assert-True (-not (Test-Path (Join-Path $scratch 'stage'))) 'staging parent empty of leftovers is acceptable'
+        $threw = $false
+        try {
+            Export-ClipboardDiagnosticsBundle -DestinationPath (Join-Path $scratch 'bad.zip') -Root $root -Status $status -Ring @(@{ Text = $secret; Level = 'PASS' }) -MaxLogBytes 32 -StagingParent (Join-Path $scratch 'stage2')
+        } catch { $threw = $true }
+        Assert-True $threw 'forbidden Text field rejected'
+        Assert-True (-not (Test-Path (Join-Path $scratch 'bad.zip'))) 'no zip after rejection'
+    }
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue

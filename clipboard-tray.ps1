@@ -372,7 +372,45 @@ $script:PauseMenuItem.Add_Click({
     })
 $menu.Items[1].Add_Click({ Show-ClipboardTrayHealth })
 $menu.Items[2].Add_Click({
-        [void][System.Windows.Forms.MessageBox]::Show('Export Diagnostics arrives in a later task. No zip was written.', 'Clipboard diagnostics')
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.FileName = Get-ClipboardExportFileName -Now (Get-Date)
+        $dialog.InitialDirectory = [Environment]::GetFolderPath('MyDocuments')
+        $dialog.Filter = 'Zip files|*.zip'
+        $dialog.OverwritePrompt = $true
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $rows = Get-TrayHealthRows
+        $policyPresent = $false
+        try { $policyPresent = [bool](Get-ClipboardPolicySignal).Present } catch { $policyPresent = $false }
+        $eventReady = $false
+        try { $eventReady = [bool](Test-ClipboardEventLogSource) } catch { $eventReady = $false }
+        $exportStatus = [pscustomobject]@{
+            status             = [string]$rows.Status
+            listener           = [string]$rows.Listener
+            startWithWindows   = [string]$rows['Start with Windows']
+            task               = [string]$rows.Task
+            taskAction         = [string]$rows['Task action']
+            sessionRewrites    = [int]$script:SessionRewrites
+            totalRewrites      = [int]$script:StateResult.State.rewriteCountTotal
+            lastActivity       = [string]$rows['Last activity']
+            lastRewrite        = [string]$rows['Last rewrite']
+            lastResult         = [string]$rows['Last result']
+            lastCharCount      = [string]$rows['Last character count']
+            lastSourceProcess  = [string]$rows['Last source process']
+            eventLog           = [string]$rows['Event Log']
+            policy             = [string]$rows.Policy
+            logFolder          = [string]$rows['Log folder']
+            toolVersion        = [string]$script:TrayToolVersion
+            coreVersion        = [string]$script:ClipboardCoreVersion
+            exportedAtUtc      = [DateTime]::UtcNow.ToString('o')
+            psVersion          = [string]$PSVersionTable.PSVersion
+            osCaption          = (Get-ClipboardOsCaption)
+            policyPresent      = $policyPresent
+            policyApplied      = $false
+            eventLogStatus     = $(if ($eventReady) { 'registered' } else { 'not registered' })
+        }
+        $ring = @()
+        if ($null -ne $script:TrayLogger -and $null -ne $script:TrayLogger.Ring) { $ring = @($script:TrayLogger.Ring) }
+        Export-ClipboardDiagnosticsBundle -DestinationPath $dialog.FileName -Root (Get-ClipboardDiagnosticsRoot) -Status $exportStatus -Ring $ring
     })
 $menu.Items[3].Add_Click({
         $enable = -not [bool]$script:StartupMenuItem.Checked

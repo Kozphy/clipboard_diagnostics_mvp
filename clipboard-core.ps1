@@ -1471,6 +1471,149 @@ function Get-ClipboardHealthRows {
     }
 }
 
+function Get-ClipboardExportFileName {
+    param([datetime]$Now)
+    $stamp = $Now
+    if ($Now.Kind -eq [System.DateTimeKind]::Utc) { $stamp = $Now.ToLocalTime() }
+    return ('clipboard-diagnostics-export-{0}.zip' -f $stamp.ToString('yyyyMMdd-HHmmss'))
+}
+
+function Get-ClipboardOsCaption {
+    try {
+        $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        if ($null -eq $operatingSystem) { return '' }
+        return [string]$operatingSystem.Caption
+    }
+    catch {
+        return ''
+    }
+}
+
+function Get-ClipboardExportFieldNames {
+    param($Record)
+    if ($null -eq $Record) { return @() }
+    if ($Record -is [System.Collections.IDictionary]) { return @($Record.Keys) }
+    return @($Record.PSObject.Properties.Name)
+}
+
+function Test-ClipboardExportForbidden {
+    param($Record)
+    $forbidden = @('Text', 'Preview', 'Html', 'Payload', 'SourceUrl', 'WindowTitle')
+    foreach ($name in @(Get-ClipboardExportFieldNames -Record $Record)) {
+        foreach ($bad in $forbidden) {
+            if ([string]::Equals([string]$name, $bad, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Export record contains forbidden field: $name"
+            }
+        }
+    }
+}
+
+function Add-ClipboardZipFile {
+    param($Archive, [string]$EntryName, [string]$SourcePath)
+    $entry = $Archive.CreateEntry($EntryName.Replace('\', '/'))
+    $inputStream = [System.IO.File]::OpenRead($SourcePath)
+    $outputStream = $entry.Open()
+    try { $inputStream.CopyTo($outputStream) }
+    finally {
+        $outputStream.Dispose()
+        $inputStream.Dispose()
+    }
+}
+
+function Export-ClipboardDiagnosticsBundle {
+    param(
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [string]$Root,
+        $Status,
+        $Ring,
+        [int]$MaxLogBytes = 524288,
+        [string]$StagingParent
+    )
+    foreach ($record in @($Ring)) { Test-ClipboardExportForbidden -Record $record }
+    Test-ClipboardExportForbidden -Record $Status
+    if ([string]::IsNullOrWhiteSpace($Root)) { $Root = Get-ClipboardDiagnosticsRoot }
+    if ([string]::IsNullOrWhiteSpace($StagingParent)) {
+        $StagingParent = Join-Path (Get-ClipboardDiagnosticsRoot) 'tmp'
+    }
+    $parentExisted = Test-Path -LiteralPath $StagingParent
+    [void][System.IO.Directory]::CreateDirectory($StagingParent)
+    $stage = Join-Path $StagingParent ([guid]::NewGuid().ToString('N'))
+    $archive = $null
+    $zipStream = $null
+    try {
+        [void][System.IO.Directory]::CreateDirectory($stage)
+        $readme = @"
+Clipboard diagnostics export
+This bundle has no clipboard text, HTML, or source URLs.
+Task: \ClipboardDiagnosticsMvp\PlainTextTray
+Shortcut: %APPDATA%\Microsoft\Windows\Start Menu\Programs\ClipboardDiagnosticsMvp.lnk
+AppUserModelID: ClipboardDiagnosticsMvp.PlainText
+"@
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText((Join-Path $stage 'README.txt'), $readme, $utf8)
+        $statusJson = if ($null -eq $Status) { '{}' } else { $Status | ConvertTo-Json -Depth 8 }
+        [System.IO.File]::WriteAllText((Join-Path $stage 'status.json'), $statusJson, $utf8)
+        foreach ($fileName in @('settings.json', 'state.json')) {
+            $source = Join-Path $Root $fileName
+            if (Test-Path -LiteralPath $source) {
+                [System.IO.File]::Copy($source, (Join-Path $stage $fileName), $true)
+            }
+            else {
+                [System.IO.File]::WriteAllText((Join-Path $stage $fileName), '{}', $utf8)
+            }
+        }
+        $memory = @($Ring)
+        if ($memory.Count -gt 20) {
+            $memory = @($memory[($memory.Count - 20)..($memory.Count - 1)])
+        }
+        [System.IO.File]::WriteAllText((Join-Path $stage 'recent-memory.json'), ($memory | ConvertTo-Json -Depth 8), $utf8)
+        $logStage = Join-Path $stage 'logs'
+        [void][System.IO.Directory]::CreateDirectory($logStage)
+        $logSource = Join-Path $Root 'logs'
+        $budget = [int64]$MaxLogBytes
+        if (Test-Path -LiteralPath $logSource) {
+            $logs = @(Get-ChildItem -LiteralPath $logSource -File | Where-Object { $_.Name -like 'operational*.log' } | Sort-Object LastWriteTimeUtc -Descending)
+            foreach ($log in $logs) {
+                if ($budget -le 0) { break }
+                $take = [Math]::Min([int64]$log.Length, $budget)
+                $target = Join-Path $logStage $log.Name
+                $buffer = New-Object byte[] $take
+                $reader = [System.IO.File]::OpenRead($log.FullName)
+                try {
+                    if ($log.Length -gt $take) { [void]$reader.Seek($log.Length - $take, [System.IO.SeekOrigin]::Begin) }
+                    [void]$reader.Read($buffer, 0, [int]$take)
+                }
+                finally { $reader.Dispose() }
+                [System.IO.File]::WriteAllBytes($target, $buffer)
+                $budget -= $take
+            }
+        }
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zipStream = [System.IO.File]::Open($DestinationPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite)
+        $archive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        foreach ($entryName in @('README.txt', 'status.json', 'settings.json', 'state.json', 'recent-memory.json')) {
+            Add-ClipboardZipFile -Archive $archive -EntryName $entryName -SourcePath (Join-Path $stage $entryName)
+        }
+        foreach ($logFile in @(Get-ChildItem -LiteralPath $logStage -File -ErrorAction SilentlyContinue)) {
+            Add-ClipboardZipFile -Archive $archive -EntryName ('logs/' + $logFile.Name) -SourcePath $logFile.FullName
+        }
+    }
+    finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        if ($null -ne $zipStream) { $zipStream.Dispose() }
+        if (Test-Path -LiteralPath $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $StagingParent) {
+            $left = @(Get-ChildItem -LiteralPath $StagingParent -Force -ErrorAction SilentlyContinue)
+            if ($left.Count -eq 0) {
+                Remove-Item -LiteralPath $StagingParent -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 function Sync-StartWithWindowsSetting {
     param($SettingsResult, [bool]$TaskInstalled)
     $settings = $SettingsResult.Settings
