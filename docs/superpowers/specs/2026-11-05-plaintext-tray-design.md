@@ -262,6 +262,7 @@ Protected formats (any one suppresses rewrite, even if a trigger is present):
 - `CF_BITMAP`, `CF_DIB`, `CF_DIBV5`, `CF_TIFF`, `CF_HDROP`, `CF_ENHMETAFILE`, `CF_METAFILEPICT`
 - WinForms names: `Bitmap`, `System.Drawing.Bitmap`, `DeviceIndependentBitmap`, `Format17`, `FileDrop`, `FileName`, `FileNameW`
 - `PNG`, `image/png`
+- WinForms names `GetFormats()` returns for the same images: `TaggedImageFileFormat`, `EnhancedMetafile`, `MetaFilePict`, `Dib`, `DibV5`, `TIFF`
 
 `Chromium Internal Source URL` is not a trigger. A copy that is only Unicode text plus that URL stays untouched.
 

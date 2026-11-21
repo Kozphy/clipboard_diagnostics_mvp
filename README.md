@@ -9,9 +9,10 @@ This repository is **not** a Cursor patch, installer, SaaS product, malware scan
 ```
 clipboard_diagnostics_mvp/
 ├── clipboard-core.ps1   # Shared rewrite, settings, logging, startup, and export
-├── clipboard-test.ps1   # Diagnostics and timed -PlainText
+├── clipboard-test.ps1   # Diagnostics, timed -PlainText, -Formats, -SetTestClipboard
 ├── clipboard-tray.ps1   # Always-on plain-text tray
 ├── README.md            # Usage, safety, troubleshooting, audit notes
+├── docs/copilot-html-paste.md  # Copilot HTML paste: cause, checks, Electron notes
 ├── LICENSE              # MIT (Kozphy, 2026)
 ├── .gitignore           # Ignores logs, reports/, output/, editor junk
 ├── tests/
@@ -23,7 +24,7 @@ clipboard_diagnostics_mvp/
 | Component | Responsibility | Used by |
 |-----------|----------------|---------|
 | `clipboard-core.ps1` | Rewrite rules, settings, logging, notifications, startup provider, export bundle | Both entrypoints |
-| `clipboard-test.ps1` | Diagnostics, remediation, image export, and timed `-PlainText` | Human operator / local shell |
+| `clipboard-test.ps1` | Diagnostics, remediation, image export, timed `-PlainText`, `-Formats`, and `-SetTestClipboard` | Human operator / local shell |
 | `clipboard-tray.ps1` | Always-on rewrite, Health, Export Diagnostics, Start with Windows | Interactive desktop |
 | `.\output\` | Timestamped PNG exports for Cursor drag-and-drop | `-ExportForCursor` |
 | `.\reports\` and `.\backups\` | Optional diagnostic reports and settings backups | Default report / `-Fix` |
@@ -31,7 +32,7 @@ clipboard_diagnostics_mvp/
 
 **Control flow (verified in script):**
 
-1. `-PlainText`, `-ExportForCursor`, `-Watch`, `-TerminalPaste`, `-BrowserTest`, and `-BrowserPasteTest` each select a dedicated mode.
+1. `-PlainText`, `-Formats`, `-SetTestClipboard`, `-ExportForCursor`, `-Watch`, `-TerminalPaste`, `-BrowserTest`, and `-BrowserPasteTest` each select a dedicated mode.
 2. Without a mode switch, run clipboard round-trips, known-blocker checks, editor checks, optional `-Fix` remediation, then show guidance and a summary.
 
 Exit codes: `0` no remaining issues, `1` remaining issues, `2` hard error (`$script:HadError`).
@@ -151,7 +152,36 @@ powershell -ExecutionPolicy Bypass -File .\clipboard-tray.ps1 -RegisterEventLog
 
 `-InstallStartup` and `-UninstallStartup` do not open the tray icon. `-RegisterEventLog` must be re-run from an elevated Windows PowerShell when it prints the access-denied error. Rewrite still works without the Event Log source. PASS does not toast. FAIL and ERROR toast. Logs and the Event Log do not contain clipboard text.
 
+Do not run the tray and `clipboard-test.ps1 -PlainText` at the same time. They share one rewrite path. If the tray is already running, the timed session refuses to start. There is no second watcher.
+
 Local data reset: Quit, run `-UninstallStartup`, delete `%LOCALAPPDATA%\clipboard_diagnostics_mvp`, and delete the Start Menu shortcut `ClipboardDiagnosticsMvp.lnk` if toasts should stop.
+
+### See which format an app pastes
+
+Edge Copilot puts Unicode text, `HTML Format`, and Chromium private formats on the clipboard together. Notepad reads the text. Electron apps such as Cursor and HeyGen HyperFrames Studio prefer `HTML Format` and can paste blank. The full cause, the Electron and HyperFrames notes, and the layer-isolation test plan are in [docs/copilot-html-paste.md](docs/copilot-html-paste.md).
+
+List formats (ids, names, sizes, Chromium flag, HTML header fields only):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -Formats
+```
+
+Pass `-Seconds` to repeat that list on each clipboard change. `-Formats` does not rewrite.
+
+Put a payload whose plain text and HTML differ, then paste into the target. Stop the tray first, and do not run `-PlainText`, or the rewriter will strip `HTML Format` before you can see it.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -SetTestClipboard
+powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -SetTestClipboard -Chromium
+```
+
+| What you see | Meaning |
+| --- | --- |
+| `PLAIN-MARKER` | The app read Unicode text. |
+| `HTML-MARKER` | The app rendered `HTML Format`. |
+| Blank | The app chose `HTML Format` and stripped it. |
+
+In HyperFrames, click the chat box, not the canvas. **Ctrl+Shift+V** pastes as plain text in Chromium. `-SetTestClipboard` replaces the clipboard and does not restore what was there. `-Clear` empties it. Neither mode prints clipboard text or the HTML body.
 
 ## Results
 
@@ -212,6 +242,8 @@ Critical paths that change external state:
 | `-Fix` restart | Stops/starts PowerToys processes | Task Manager / `Get-Process` | Start PowerToys from Start Menu |
 | `-ExportForCursor` | Writes PNG under `.\output\` | File on disk + PASS path line | Delete PNG if sensitive |
 | `-OpenFolder` | Launches Explorer | Explorer window | Close Explorer window |
+| `-Formats` | Reads format ids, names, and sizes | Console listing | No clipboard change to undo |
+| `-SetTestClipboard` | Replaces the clipboard with marker text and HTML, or clears it | Console marker names and format list | Re-copy the previous data; the previous clipboard is not saved |
 
 Evidence available for review: console transcript of the run; `.\output\*.png` timestamps; on-disk `ShareClipboard` value. No append-only audit log file is written by this MVP.
 
@@ -220,7 +252,8 @@ Evidence available for review: console transcript of the run; `.\output\*.png` t
 - **Single-script MVP** keeps install surface zero and makes behavior auditable in one file.  
 - **Export mode is isolated** from diagnose mode so round-trip tests cannot destroy a screenshot the user just copied for Cursor.  
 - **Regex settings patch** preferred over `ConvertTo-Json` round-trip on Windows PowerShell 5.1 to reduce risk of reformatting/secret field churn in PowerToys settings.  
-- **Not implemented:** patching Cursor, global hooks, network telemetry, and automated Advanced Paste disable. The tray is the supported background persistence.
+- **Not implemented:** patching Cursor, global hooks, network telemetry, and automated Advanced Paste disable. The tray is the supported background persistence. A second plain-text watcher is intentionally not shipped; it would race the tray and `-PlainText`.
+- **Image names:** TIFF and metafile copies are protected under the names `GetFormats()` returns (`TaggedImageFileFormat`, `EnhancedMetafile`, `MetaFilePict`), matching the CF_* image formats the rewrite already skipped.
 
 ## Design / Roadmap
 
