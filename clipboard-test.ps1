@@ -35,6 +35,12 @@
 #   -PlainText         Foreground, time-bounded (-Seconds). Rewrites matching
 #                      HTML/Chromium copies to Unicode in place. Does not
 #                      restore HTML and does not record clipboard payloads.
+#   -Formats           List clipboard formats (id, name, size). HTML Format
+#                      contributes header fields only. Pass -Seconds to repeat
+#                      the list on each change. Does not rewrite.
+#   -SetTestClipboard  Replace the clipboard with plain-text and HTML markers
+#                      that differ, so a paste shows which format an app read.
+#                      Does not restore the previous clipboard.
 #
 # Side effects (by mode):
 #   Diagnose:       clipboard temporarily overwritten by test data, then
@@ -57,6 +63,10 @@
 #   -ExportForCursor: creates .\output\ if missing; writes
 #                   clipboard-for-cursor-*.png; may Start-Process explorer.exe
 #                   when -OpenFolder is set.
+#   -Formats:       reads format ids, names, and sizes. Does not modify the
+#                   clipboard. HTML bodies are not printed or saved.
+#   -SetTestClipboard: replaces the clipboard with the marker payload, or
+#                   clears it with -Clear. Does not restore the previous data.
 #   -WhatIf:        previews every change above (clipboard writes, file writes,
 #                   backups, process/service restarts, browser launch,
 #                   report/log files) without performing it. Read-only checks
@@ -160,6 +170,29 @@
     -Seconds seconds. Does not restore the rich formats and does not record
     clipboard text.
 
+.PARAMETER Formats
+    List every clipboard format (id, name, byte size). Chromium formats are
+    flagged. HTML Format prints header fields only. With -Seconds, repeat the
+    list until that many seconds pass. Does not rewrite or restore.
+
+.PARAMETER SetTestClipboard
+    Put Unicode text PLAIN-MARKER and an HTML Format fragment HTML-MARKER on
+    the clipboard. Optional -Chromium adds a fake Chromium source URL format.
+    -Clear empties the clipboard instead. Previous clipboard contents are not
+    saved or restored.
+
+.PARAMETER PlainMarker
+    With -SetTestClipboard, the Unicode text token. Default PLAIN-MARKER.
+
+.PARAMETER HtmlMarker
+    With -SetTestClipboard, the text inside the HTML fragment. Default HTML-MARKER.
+
+.PARAMETER Chromium
+    With -SetTestClipboard, also set a fake "Chromium internal source URL" format.
+
+.PARAMETER Clear
+    With -SetTestClipboard, empty the clipboard and exit.
+
 .PARAMETER ShowText
     Include up to the first 40 characters of clipboard text in -Watch output,
     in mismatch diagnostics and in the JSON report. Off by default (privacy).
@@ -222,6 +255,12 @@ Browser for browser tests: default (system default), msedge, or chrome.
     # 1) Copy a screenshot  2) run this  3) drag the PNG into Cursor Agent
     powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -ExportForCursor -OpenFolder
 
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -Formats
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\clipboard-test.ps1 -SetTestClipboard -Chromium
+
 .NOTES
     Engineering Notes:
       - Native clipboard calls live in an Add-Type C# helper (namespace
@@ -266,7 +305,13 @@ param(
     [switch]$ExportForCursor,
     [switch]$OpenFolder,
     [switch]$NoReport,
-    [switch]$PlainText
+    [switch]$PlainText,
+    [switch]$Formats,
+    [switch]$SetTestClipboard,
+    [string]$PlainMarker = 'PLAIN-MARKER',
+    [string]$HtmlMarker = 'HTML-MARKER',
+    [switch]$Chromium,
+    [switch]$Clear
 )
 
 $ErrorActionPreference = "Stop"
@@ -288,9 +333,20 @@ $script:NativeTried = $false
 $script:VimClipboardKeys = @('<C-c>', '<C-v>')
 $script:BrowserProcessNames = @('msedge', 'chrome', 'firefox', 'brave', 'opera', 'vivaldi', 'iexplore', 'arc')
 $script:BoundParams = [ordered]@{}
+$script:StaForwardArgs = New-Object System.Collections.Generic.List[string]
 foreach ($key in $PSBoundParameters.Keys) {
     $script:BoundParams[$key] = [string]$PSBoundParameters[$key]
+    $bound = $PSBoundParameters[$key]
+    if ($bound -is [System.Management.Automation.SwitchParameter]) {
+        if ($bound) { [void]$script:StaForwardArgs.Add("-$key") }
+    }
+    else {
+        [void]$script:StaForwardArgs.Add("-$key")
+        [void]$script:StaForwardArgs.Add([string]$bound)
+    }
 }
+[void]$script:BoundParams.Remove('PlainMarker')
+[void]$script:BoundParams.Remove('HtmlMarker')
 
 $script:EditorTargets = @(
     [pscustomobject]@{ Name = 'Cursor';           Settings = (Join-Path $env:APPDATA 'Cursor\User\settings.json');          Keybindings = (Join-Path $env:APPDATA 'Cursor\User\keybindings.json');          Extensions = (Join-Path $env:USERPROFILE '.cursor\extensions') }
@@ -4260,7 +4316,15 @@ function Show-Summary {
         }
     }
     elseif (-not $script:HadError) {
-        Write-Host "PASS: No clipboard issues detected by this diagnostic." -ForegroundColor Green
+        if ($Mode -eq 'Formats') {
+            Write-Host "PASS: Listed clipboard formats (metadata only)." -ForegroundColor Green
+        }
+        elseif ($Mode -eq 'SetTestClipboard') {
+            Write-Host "PASS: Marker clipboard update finished." -ForegroundColor Green
+        }
+        else {
+            Write-Host "PASS: No clipboard issues detected by this diagnostic." -ForegroundColor Green
+        }
     }
 
     if ($Mode -eq 'Diagnose') {
@@ -4284,6 +4348,12 @@ function Show-Summary {
         'BrowserTest' { 'Privacy: only a generated token was copied by the test page; your clipboard was restored afterwards.' }
         'BrowserPasteTest' { 'Privacy: the browser test reports clipboard format names and text lengths only; clipboard contents are neither modified nor saved.' }
         'PlainText' { 'Privacy: plain-text mode rewrites HTML and Chromium web formats to Unicode text and records character counts, format names, and process names only.' }
+        'Formats' { 'Privacy: format listing prints format ids, names, sizes, and HTML header fields only. Clipboard text and HTML bodies are not printed or saved.' }
+        'SetTestClipboard' {
+            if ($WhatIfPreference) { 'Privacy: -WhatIf - the clipboard was not modified. Marker names were printed; the HTML document was not.' }
+            elseif ($Clear) { 'Privacy: the clipboard was cleared. Previous contents were not saved.' }
+            else { 'Privacy: the clipboard was replaced with the marker payload and was not restored. The console prints the marker tokens. The JSON report stores marker lengths and format names, not the tokens or the HTML body.' }
+        }
         default { 'Privacy: export mode reads the current clipboard image and writes a PNG under .\output\.' }
     }
     Write-Host $privacy -ForegroundColor DarkYellow
@@ -4488,6 +4558,348 @@ function Invoke-PlainTextSession {
     elseif ($code -eq 1) { Add-Issue 'Plain-text rewrite reported one or more failures.' }
 }
 
+function Test-ClipboardWindowsHost {
+    <#
+    .SYNOPSIS
+        True on Windows PowerShell 5.1 and on PowerShell 7 when $IsWindows is set.
+    .NOTES
+        Audit Notes: no clipboard access.
+    #>
+    if (Get-Variable -Name IsWindows -Scope Global -ErrorAction SilentlyContinue) {
+        return [bool]$IsWindows
+    }
+    return $true
+}
+
+function Invoke-ClipboardStaChildIfNeeded {
+    <#
+    .SYNOPSIS
+        Relaunch this script under Windows PowerShell -STA when the host is MTA.
+    .NOTES
+        Exits the process when a child is started. Audit Notes: no clipboard payload is forwarded.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ChildVariable)
+    $apartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
+    if ($apartment -ne [System.Threading.ApartmentState]::MTA) { return }
+    if ([Environment]::GetEnvironmentVariable($ChildVariable) -eq '1') { return }
+    [Environment]::SetEnvironmentVariable($ChildVariable, '1')
+    $relaunch = Get-StaRelaunchArguments -ScriptPath $PSCommandPath -Arguments $script:StaForwardArgs.ToArray()
+    $hostExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $hostExe)) { $hostExe = (Get-Command powershell).Source }
+    $child = Start-Process -FilePath $hostExe -ArgumentList $relaunch -Wait -PassThru -NoNewWindow
+    exit $child.ExitCode
+}
+
+function Invoke-ClipboardBusyRetry {
+    <#
+    .SYNOPSIS
+        Retry a clipboard call while another process holds it open.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [int]$Tries = 8
+    )
+    $delay = 25
+    for ($i = 1; $i -le $Tries; $i++) {
+        try {
+            return (& $Action)
+        }
+        catch {
+            $busy = ($_.Exception -is [System.Runtime.InteropServices.ExternalException]) -or
+                ($_.Exception.Message -match 'CLIPBRD|OpenClipboard|clipboard')
+            if ((-not $busy) -or ($i -eq $Tries)) { throw }
+            Start-Sleep -Milliseconds $delay
+            $delay = [Math]::Min(200, $delay * 2)
+        }
+    }
+}
+
+function Initialize-ClipboardFormatListNative {
+    <#
+    .SYNOPSIS
+        Compile the format-list P/Invoke helper once per process.
+    #>
+    if ('ClipDiagFormatList.Native' -as [type]) { return $true }
+    if (-not (Test-ClipboardWindowsHost)) { return $false }
+    $source = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace ClipDiagFormatList {
+    public static class Native {
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool OpenClipboard(IntPtr hWndNewOwner);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool CloseClipboard();
+        [DllImport("user32.dll")]
+        public static extern uint EnumClipboardFormats(uint format);
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetClipboardData(uint uFormat);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int GetClipboardFormatName(uint format, StringBuilder lpszFormatName, int cchMaxCount);
+        [DllImport("kernel32.dll")]
+        public static extern uint GlobalSize(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GlobalLock(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        public static extern bool GlobalUnlock(IntPtr hMem);
+        [DllImport("user32.dll")]
+        public static extern uint GetClipboardSequenceNumber();
+        public static bool TryOpenClipboard(int tries, int delayMs) {
+            for (int i = 0; i < tries; i++) {
+                if (OpenClipboard(IntPtr.Zero)) return true;
+                System.Threading.Thread.Sleep(delayMs);
+            }
+            return false;
+        }
+    }
+}
+'@
+    try {
+        Add-Type -TypeDefinition $source -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+    return ($null -ne ('ClipDiagFormatList.Native' -as [type]))
+}
+
+function Get-RegisteredClipboardFormatName {
+    param([uint32]$Id)
+    $sb = New-Object System.Text.StringBuilder 512
+    $count = [ClipDiagFormatList.Native]::GetClipboardFormatName($Id, $sb, $sb.Capacity)
+    if ($count -gt 0) { return $sb.ToString() }
+    return $null
+}
+
+function Get-ClipboardFormatSnapshot {
+    <#
+    .SYNOPSIS
+        Read clipboard format ids, names, sizes, and HTML header fields.
+    .NOTES
+        Does not return clipboard text or HTML bodies. Audit Notes: read-only.
+    #>
+    if (-not (Initialize-ClipboardFormatListNative)) {
+        return [pscustomobject]@{
+            Ok       = $false
+            Error    = 'Windows clipboard format APIs are not available on this host.'
+            Sequence = [uint32]0
+            Rows     = @()
+        }
+    }
+    $opened = [ClipDiagFormatList.Native]::TryOpenClipboard(8, 30)
+    if (-not $opened) {
+        return [pscustomobject]@{
+            Ok       = $false
+            Error    = 'OpenClipboard failed (clipboard busy).'
+            Sequence = [uint32]0
+            Rows     = @()
+        }
+    }
+    try {
+        $sequence = [uint32][ClipDiagFormatList.Native]::GetClipboardSequenceNumber()
+        $rows = New-Object System.Collections.Generic.List[object]
+        $fmt = [uint32]0
+        while ($true) {
+            $fmt = [uint32][ClipDiagFormatList.Native]::EnumClipboardFormats($fmt)
+            if ($fmt -eq 0) { break }
+            $registered = Get-RegisteredClipboardFormatName -Id $fmt
+            $byteCount = $null
+            $htmlBytes = $null
+            $handle = [ClipDiagFormatList.Native]::GetClipboardData($fmt)
+            if ($handle -ne [IntPtr]::Zero) {
+                try { $byteCount = [uint32][ClipDiagFormatList.Native]::GlobalSize($handle) } catch { $byteCount = $null }
+                $standard = Get-StandardClipboardFormatName -Id $fmt
+                $display = Format-ClipboardFormatDisplayName -StandardName $standard -RegisteredName $registered
+                $isHtml = Test-ClipboardHtmlFormatName -Name $display -RegisteredName $registered
+                if ($isHtml -and $null -ne $byteCount -and $byteCount -gt 0 -and $byteCount -le 20971520) {
+                    $locked = [ClipDiagFormatList.Native]::GlobalLock($handle)
+                    if ($locked -ne [IntPtr]::Zero) {
+                        try {
+                            $htmlBytes = New-Object byte[] ([int]$byteCount)
+                            [System.Runtime.InteropServices.Marshal]::Copy($locked, $htmlBytes, 0, [int]$byteCount)
+                        }
+                        catch {
+                            $htmlBytes = $null
+                        }
+                        finally {
+                            [void][ClipDiagFormatList.Native]::GlobalUnlock($handle)
+                        }
+                    }
+                }
+            }
+            [void]$rows.Add((New-ClipboardFormatRow -Id $fmt -RegisteredName $registered -ByteCount $byteCount -HtmlBytes $htmlBytes))
+            $htmlBytes = $null
+        }
+        return [pscustomobject]@{
+            Ok       = $true
+            Error    = $null
+            Sequence = $sequence
+            Rows     = $rows.ToArray()
+        }
+    }
+    finally {
+        [void][ClipDiagFormatList.Native]::CloseClipboard()
+    }
+}
+
+function Test-ClipboardRewriterRunning {
+    <#
+    .SYNOPSIS
+        True when the tray or a timed plain-text session holds its mutex.
+    .NOTES
+        Probes and releases. Does not keep either mutex. Audit Notes: no clipboard access.
+    #>
+    foreach ($kind in @('Tray', 'PlainTextSession')) {
+        $mutex = $null
+        try {
+            $mutex = New-Object System.Threading.Mutex($false, (Get-ClipboardMutexName -Kind $kind))
+            $acquired = $mutex.WaitOne(0)
+            if ($acquired) { [void]$mutex.ReleaseMutex() }
+            else { return $true }
+        }
+        catch { }
+        finally {
+            if ($null -ne $mutex) { $mutex.Dispose() }
+        }
+    }
+    return $false
+}
+
+function Publish-ClipboardFormatSnapshot {
+    param($Snapshot)
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    if (-not $Snapshot.Ok) {
+        Write-Host ("=== Clipboard formats  {0}  sequence={1} ===" -f $stamp, $Snapshot.Sequence)
+        Write-Host ("ERROR: {0}" -f $Snapshot.Error)
+        return
+    }
+    Write-Host (Format-ClipboardFormatListing -Rows $Snapshot.Rows -Sequence $Snapshot.Sequence -Timestamp $stamp)
+    $safeRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @($Snapshot.Rows)) {
+        if ($null -eq $row) { continue }
+        [void]$safeRows.Add([ordered]@{
+                id         = [uint32]$row.Id
+                name       = [string]$row.Name
+                bytes      = $row.Bytes
+                class      = [string]$row.Class
+                chromium   = [bool]$row.Chromium
+                htmlHeader = $row.HtmlHeader
+            })
+    }
+    $script:Report.formatList = $safeRows.ToArray()
+}
+
+function Invoke-ClipboardFormatsMode {
+    <#
+    .SYNOPSIS
+        Print the current clipboard formats. Optionally repeat until -Seconds elapses.
+    .NOTES
+        Read-only. Does not call the plain-text rewriter. -ShowText is ignored.
+    #>
+    param([int]$FollowSeconds = 0)
+    if ($ShowText) {
+        Write-Host '-ShowText is ignored for -Formats.'
+    }
+    if (-not (Test-ClipboardWindowsHost)) {
+        Write-Err 'Format listing needs the Windows clipboard. This host has no Win32 clipboard.'
+        return
+    }
+    if (Test-ClipboardRewriterRunning) {
+        Write-WarnLine 'A plain-text rewriter is running (tray or -PlainText), so this list may already be Unicode text only. Do not run the tray and -PlainText at the same time.'
+    }
+    $snapshot = Get-ClipboardFormatSnapshot
+    Publish-ClipboardFormatSnapshot -Snapshot $snapshot
+    if (-not $snapshot.Ok) {
+        $script:HadError = $true
+        return
+    }
+    if ($FollowSeconds -le 0) { return }
+    Write-Host ("Watching format changes for {0} s (Esc stops). This mode does not rewrite." -f $FollowSeconds)
+    $deadline = (Get-Date).AddSeconds($FollowSeconds)
+    $previous = [uint32]$snapshot.Sequence
+    while ((Get-Date) -lt $deadline) {
+        if (Test-PlainTextStopRequested) { break }
+        Start-Sleep -Milliseconds 200
+        $current = [uint32](Get-ClipboardSequenceNumber)
+        if ($current -eq $previous) { continue }
+        $previous = $current
+        Write-Host ''
+        $snapshot = Get-ClipboardFormatSnapshot
+        Publish-ClipboardFormatSnapshot -Snapshot $snapshot
+    }
+}
+
+function Invoke-SetTestClipboardMode {
+    <#
+    .SYNOPSIS
+        Place the marker payload on the clipboard, or clear it.
+    .NOTES
+        Does not restore the previous clipboard. Does not print HtmlDocument.
+        -ShowText is ignored.
+    #>
+    if ($ShowText) {
+        Write-Host '-ShowText is ignored for -SetTestClipboard.'
+    }
+    if (-not (Test-ClipboardWindowsHost)) {
+        Write-Err 'The marker payload needs the Windows clipboard. This host has no Win32 clipboard.'
+        return
+    }
+    $rewriter = Test-ClipboardRewriterRunning
+    if ($rewriter) {
+        Write-WarnLine 'A plain-text rewriter is already running (tray or -PlainText). It may remove HTML Format before you paste. Stop it when the HTML marker must survive. Do not run the tray and -PlainText at the same time.'
+    }
+    if ($Clear) {
+        $apply = (-not $WhatIfPreference) -and (Confirm-Change 'Windows clipboard' 'Clear')
+        if ($apply) {
+            Add-Type -AssemblyName System.Windows.Forms
+            Invoke-ClipboardBusyRetry -Action { [System.Windows.Forms.Clipboard]::Clear() }
+            Write-Host 'Clipboard cleared.'
+            Publish-ClipboardFormatSnapshot -Snapshot (Get-ClipboardFormatSnapshot)
+        }
+        else {
+            Write-Host 'Set-TestClipboard: preview only. The clipboard was not cleared.'
+        }
+        $script:Report.marker = [ordered]@{ action = $(if ($apply) { 'clear' } else { 'preview' }); plainChars = 0; htmlChars = 0; chromium = $false }
+        return
+    }
+    $payload = New-ClipboardMarkerPayload -PlainMarker $PlainMarker -HtmlMarker $HtmlMarker -IncludeChromium:([bool]$Chromium)
+    $applyPayload = (-not $WhatIfPreference) -and (Confirm-Change 'Windows clipboard' 'Replace with HTML and plain-text markers')
+    $present = @($payload.FormatNames)
+    if ($applyPayload) {
+        Add-Type -AssemblyName System.Windows.Forms
+        $data = New-Object System.Windows.Forms.DataObject
+        $data.SetText($payload.PlainText, [System.Windows.Forms.TextDataFormat]::UnicodeText)
+        $data.SetData([System.Windows.Forms.DataFormats]::Html, $payload.HtmlDocument)
+        $stream = $null
+        if ($null -ne $payload.ChromiumBytes) {
+            $stream = New-Object System.IO.MemoryStream
+            $stream.Write($payload.ChromiumBytes, 0, $payload.ChromiumBytes.Length)
+            $stream.Position = 0
+            $data.SetData([string]$payload.ChromiumFormatName, $stream)
+        }
+        try {
+            Invoke-ClipboardBusyRetry -Action { [System.Windows.Forms.Clipboard]::SetDataObject($data, $true) }
+        }
+        finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+        }
+        $snapshot = Get-ClipboardFormatSnapshot
+        Publish-ClipboardFormatSnapshot -Snapshot $snapshot
+        if ($snapshot.Ok) {
+            $present = @($snapshot.Rows | ForEach-Object { $_.Name })
+        }
+    }
+    Write-Host (Format-ClipboardMarkerSummary -Payload $payload -FormatNamesPresent $present -Applied:$applyPayload)
+    $script:Report.marker = [ordered]@{
+        action     = $(if ($applyPayload) { 'set' } else { 'preview' })
+        plainChars = $payload.PlainText.Length
+        htmlChars  = $payload.HtmlMarker.Length
+        chromium   = [bool]$Chromium
+        formats    = @($present)
+    }
+}
+
 $selectedModes = @()
 if ($ExportForCursor) { $selectedModes += 'ExportForCursor' }
 if ($Watch) { $selectedModes += 'Watch' }
@@ -4495,14 +4907,20 @@ if ($TerminalPaste) { $selectedModes += 'TerminalPaste' }
 if ($BrowserTest) { $selectedModes += 'BrowserTest' }
 if ($BrowserPasteTest) { $selectedModes += 'BrowserPasteTest' }
 if ($PlainText) { $selectedModes += 'PlainText' }
+if ($Formats) { $selectedModes += 'Formats' }
+if ($SetTestClipboard) { $selectedModes += 'SetTestClipboard' }
 
-$runMode = Get-ClipboardRunMode -PlainText:$PlainText -Watch:$Watch -Fix:$Fix -ExportForCursor:$ExportForCursor -TerminalPaste:$TerminalPaste -BrowserTest:$BrowserTest -BrowserPasteTest:$BrowserPasteTest
+$runMode = Get-ClipboardRunMode -PlainText:$PlainText -Watch:$Watch -Fix:$Fix -ExportForCursor:$ExportForCursor -TerminalPaste:$TerminalPaste -BrowserTest:$BrowserTest -BrowserPasteTest:$BrowserPasteTest -Formats:$Formats -SetTestClipboard:$SetTestClipboard
 Write-Host "Windows Clipboard Diagnostics $($script:ToolVersion)" -ForegroundColor Cyan
 if ($runMode.ExitCode -eq 2) {
     Write-Host "ERROR: Choose one mode at a time." -ForegroundColor Red
     exit 2
 }
 $mode = $runMode.Mode
+if (-not $SetTestClipboard -and ($Clear -or $Chromium -or $PSBoundParameters.ContainsKey('PlainMarker') -or $PSBoundParameters.ContainsKey('HtmlMarker'))) {
+    Write-Host 'ERROR: -Clear, -Chromium, -PlainMarker, and -HtmlMarker require -SetTestClipboard.'
+    exit 2
+}
 $script:Report.mode = $mode
 Write-Host "Mode: $(if ($mode -eq 'Diagnose') { if ($Fix) { 'Diagnose + Fix' } else { 'Diagnose only' } } else { $mode })"
 if ($WhatIfPreference) {
@@ -4520,27 +4938,31 @@ try {
         'BrowserTest' { Test-HostPrerequisites; Invoke-BrowserClipboardTest }
         'BrowserPasteTest' { Invoke-BrowserPasteTest }
         'PlainText' {
-            $apartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
-            if ($apartment -eq [System.Threading.ApartmentState]::MTA -and -not $env:CLIPBOARD_PLAINTEXT_STA_CHILD) {
-                $env:CLIPBOARD_PLAINTEXT_STA_CHILD = '1'
-                $forward = New-Object System.Collections.Generic.List[string]
-                foreach ($key in $PSBoundParameters.Keys) {
-                    $bound = $PSBoundParameters[$key]
-                    if ($bound -is [System.Management.Automation.SwitchParameter]) {
-                        if ($bound) { $forward.Add("-$key") }
-                    }
-                    else {
-                        $forward.Add("-$key")
-                        $forward.Add([string]$bound)
-                    }
-                }
-                $relaunch = Get-StaRelaunchArguments -ScriptPath $PSCommandPath -Arguments $forward.ToArray()
-                $hostExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-                if (-not (Test-Path -LiteralPath $hostExe)) { $hostExe = (Get-Command powershell).Source }
-                $child = Start-Process -FilePath $hostExe -ArgumentList $relaunch -Wait -PassThru -NoNewWindow
-                exit $child.ExitCode
-            }
+            Invoke-ClipboardStaChildIfNeeded -ChildVariable 'CLIPBOARD_PLAINTEXT_STA_CHILD'
             Invoke-PlainTextSession -Seconds $Seconds -ShowText $ShowText.IsPresent -WhatIf:$WhatIfPreference
+        }
+        'Formats' {
+            if (-not (Test-ClipboardWindowsHost)) {
+                Write-Err 'Format listing needs the Windows clipboard. This host has no Win32 clipboard.'
+            }
+            else {
+                Invoke-ClipboardStaChildIfNeeded -ChildVariable 'CLIPBOARD_FORMATS_STA_CHILD'
+                $follow = 0
+                if ($PSBoundParameters.ContainsKey('Seconds')) { $follow = $Seconds }
+                Invoke-ClipboardFormatsMode -FollowSeconds $follow
+            }
+        }
+        'SetTestClipboard' {
+            if (-not (Test-ClipboardWindowsHost)) {
+                Write-Err 'The marker payload needs the Windows clipboard. This host has no Win32 clipboard.'
+            }
+            else {
+                Invoke-ClipboardStaChildIfNeeded -ChildVariable 'CLIPBOARD_MARKER_STA_CHILD'
+                if ($PSBoundParameters.ContainsKey('Seconds')) {
+                    Write-Host '-Seconds is ignored for -SetTestClipboard.'
+                }
+                Invoke-SetTestClipboardMode
+            }
         }
         default { Invoke-Diagnose }
     }

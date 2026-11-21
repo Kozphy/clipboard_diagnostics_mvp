@@ -260,6 +260,14 @@ try {
         Assert-Equal 'NeedsRewrite' $url.Reason 'source url is not protected'
         $rtf = Test-ClipboardNeedsPlainText -FormatNames @('Rich Text Format', 'UnicodeText') -HasExtractableText $true
         Assert-Equal 'AlreadyPlain' $rtf.Reason 'rtf alone is not a trigger'
+        $emf = Test-ClipboardNeedsPlainText -FormatNames @('HTML Format', 'EnhancedMetafile') -HasExtractableText $true
+        Assert-Equal 'ProtectedFormat' $emf.Reason 'enhanced metafile wins'
+        $tiff = Test-ClipboardNeedsPlainText -FormatNames @('HTML Format', 'TaggedImageFileFormat') -HasExtractableText $true
+        Assert-Equal 'ProtectedFormat' $tiff.Reason 'tiff name wins'
+        $pict = Test-ClipboardNeedsPlainText -FormatNames @('HTML Format', 'MetaFilePict') -HasExtractableText $true
+        Assert-Equal 'ProtectedFormat' $pict.Reason 'metafile pict wins'
+        $urlOnly = Test-ClipboardNeedsPlainText -FormatNames @('UnicodeText', 'Chromium Internal Source URL') -HasExtractableText $true
+        Assert-Equal 'AlreadyPlain' $urlOnly.Reason 'chromium source url alone is not a trigger'
         $none = Test-ClipboardNeedsPlainText -FormatNames @('HTML Format') -HasExtractableText $false
         Assert-Equal 'NoExtractableText' $none.Reason 'trigger without text'
         Assert-Equal 'False' $none.NeedsRewrite 'no rewrite flag'
@@ -398,6 +406,16 @@ try {
         Assert-Equal 'Local\ClipboardDiagnosticsMvp.Tray' (Get-ClipboardMutexName -Kind Tray) 'tray mutex'
         Assert-Equal 'Local\ClipboardDiagnosticsMvp.Rewrite' (Get-ClipboardMutexName -Kind Rewrite) 'rewrite mutex'
         Assert-Equal 'Local\ClipboardDiagnosticsMvp.PlainTextSession' (Get-ClipboardMutexName -Kind PlainTextSession) 'session mutex'
+        $formatsMode = Get-ClipboardRunMode -PlainText $false -Watch $false -Fix $false -ExportForCursor $false -TerminalPaste $false -BrowserTest $false -BrowserPasteTest $false -Formats $true
+        Assert-Equal 'Formats' $formatsMode.Mode 'formats mode'
+        Assert-Equal 0 $formatsMode.ExitCode 'formats alone is valid'
+        $markerMode = Get-ClipboardRunMode -PlainText $false -Watch $false -Fix $false -ExportForCursor $false -TerminalPaste $false -BrowserTest $false -BrowserPasteTest $false -SetTestClipboard $true
+        Assert-Equal 'SetTestClipboard' $markerMode.Mode 'marker mode'
+        Assert-Equal 0 $markerMode.ExitCode 'marker alone is valid'
+        $mixed = Get-ClipboardRunMode -PlainText $true -Watch $false -Fix $false -ExportForCursor $false -TerminalPaste $false -BrowserTest $false -BrowserPasteTest $false -Formats $true
+        Assert-Equal 2 $mixed.ExitCode 'plain text plus formats'
+        $fixed = Get-ClipboardRunMode -PlainText $false -Watch $false -Fix $true -ExportForCursor $false -TerminalPaste $false -BrowserTest $false -BrowserPasteTest $false -SetTestClipboard $true
+        Assert-Equal 2 $fixed.ExitCode 'marker plus fix'
         $relaunch = Get-StaRelaunchArguments -ScriptPath 'C:\Program Files\clipboard_diagnostics_mvp\clipboard-test.ps1' -Arguments @('-PlainText','-Seconds','600')
         Assert-True ($relaunch -match '-STA') 'sta flag'
         Assert-True ($relaunch -match '-File "C:\\Program Files\\clipboard_diagnostics_mvp\\clipboard-test.ps1"') 'script quoted'
@@ -608,6 +626,157 @@ try {
         Assert-True $threw 'forbidden Text field rejected'
         Assert-True (-not (Test-Path (Join-Path $scratch 'bad.zip'))) 'no zip after rejection'
     }
+    Invoke-Test 'format classification, HTML header fields, and marker payload' {
+        Assert-Equal 'CF_UNICODETEXT' (Get-StandardClipboardFormatName -Id 13) 'unicode id'
+        Assert-Equal 'CF_TEXT' (Get-StandardClipboardFormatName -Id 1) 'text id'
+        Assert-Equal 'CF_HDROP' (Get-StandardClipboardFormatName -Id 15) 'hdrop id'
+        Assert-Equal 'CF_DIBV5' (Get-StandardClipboardFormatName -Id 17) 'dibv5 id'
+        Assert-True ($null -eq (Get-StandardClipboardFormatName -Id 49161)) 'registered id has no standard name'
+        Assert-Equal 'CF_UNICODETEXT' (Format-ClipboardFormatDisplayName -StandardName 'CF_UNICODETEXT' -RegisteredName $null) 'standard label'
+        Assert-Equal 'HTML Format' (Format-ClipboardFormatDisplayName -StandardName $null -RegisteredName 'HTML Format') 'registered label'
+        Assert-Equal 'CF_TEXT / legacy' (Format-ClipboardFormatDisplayName -StandardName 'CF_TEXT' -RegisteredName 'legacy') 'both labels'
+        Assert-Equal 'UNNAMED' (Format-ClipboardFormatDisplayName -StandardName $null -RegisteredName $null) 'unnamed label'
+        Assert-Equal 'Chromium' (Get-ClipboardFormatClass -Name 'Chromium internal source URL') 'chromium class'
+        Assert-Equal 'Html' (Get-ClipboardFormatClass -Name 'HTML Format') 'html class'
+        Assert-Equal 'Html' (Get-ClipboardFormatClass -Name 'text/html') 'text/html class'
+        Assert-Equal 'Protected' (Get-ClipboardFormatClass -Name 'EnhancedMetafile') 'protected class'
+        Assert-Equal 'Text' (Get-ClipboardFormatClass -Name 'CF_UNICODETEXT') 'text class'
+        Assert-Equal 'Other' (Get-ClipboardFormatClass -Name 'Rich Text Format') 'rtf stays other'
+        Assert-Equal 'Unnamed' (Get-ClipboardFormatClass -Name '') 'empty class'
+        Assert-True ((@(Get-ClipboardTriggerFormatNames)).Count -eq 3) 'trigger set stays three names'
+        Assert-True ((@(Get-ClipboardProtectedFormatNames)) -contains 'TaggedImageFileFormat') 'tiff alias protected'
+
+        $secret = 'FRAGMENT-SECRET-PHRASE'
+        $template = "Version:1.0`r`nStartHTML:{0}`r`nEndHTML:0000000999`r`nStartFragment:{0}`r`nEndFragment:0000000999`r`nSourceURL:https://user:SECRETUSER@example.com/notes?token=SECRETQUERY#SECRETFRAG`r`n"
+        $dummy = $template -f ('0' * 10)
+        $start = $dummy.Length
+        $head = $template -f $start.ToString('D10')
+        Assert-Equal $dummy.Length $head.Length 'test header width'
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        $bytes = $utf8.GetBytes($head + "<html>$secret</html>")
+        $meta = Get-ClipboardHtmlHeaderMetadata -Bytes $bytes
+        Assert-Equal '1.0' $meta.Version 'version field'
+        Assert-Equal 'https://example.com/notes' $meta.SourceURL 'query userinfo and fragment dropped'
+        $metaJson = ConvertTo-Json $meta
+        Assert-True ($metaJson -notmatch [regex]::Escape($secret)) 'fragment body absent'
+        Assert-True ($metaJson -notmatch 'SECRETUSER') 'userinfo absent'
+        Assert-True ($metaJson -notmatch 'SECRETQUERY') 'query absent'
+        Assert-True ($metaJson -notmatch 'SECRETFRAG') 'fragment absent'
+        $noOffset = $utf8.GetBytes("Version:0.9`r`nSourceURL:https://example.com/only`r`n<html>$secret</html>")
+        $cut = Get-ClipboardHtmlHeaderMetadata -Bytes $noOffset
+        Assert-Equal 'https://example.com/only' $cut.SourceURL 'cut at markup'
+        Assert-True ((ConvertTo-Json $cut) -notmatch [regex]::Escape($secret)) 'markup tail absent'
+        $rawUrl = 'not a url SECRETTOKEN'
+        $bad = Get-ClipboardHtmlHeaderMetadata -Bytes $utf8.GetBytes("Version:0.9`r`nSourceURL:$rawUrl`r`n<html>$secret</html>")
+        Assert-Equal ('unparseable (len={0})' -f $rawUrl.Length) $bad.SourceURL 'raw url not returned'
+        Assert-True ((ConvertTo-Json $bad) -notmatch 'SECRETTOKEN') 'token absent'
+        $padded = ('X' * 600) + 'SourceURL:https://secret.example/SECRETTAIL'
+        $capped = Get-ClipboardHtmlHeaderMetadata -Bytes $utf8.GetBytes($padded)
+        Assert-True ($null -eq $capped -or (ConvertTo-Json $capped) -notmatch 'SECRETTAIL') 'cap drops the tail'
+        $utf16Template = "Version:0.9`r`nStartHTML:{0}`r`nSourceURL:https://example.com/utf16`r`n"
+        $utf16Dummy = $utf16Template -f ('0' * 10)
+        $utf16Head = $utf16Template -f $utf16Dummy.Length.ToString('D10')
+        $utf16Body = [System.Text.Encoding]::Unicode.GetBytes($utf16Head + '<html>UTF16-SECRET-BODY</html>')
+        $utf16Bytes = New-Object byte[] ($utf16Body.Length + 2)
+        $utf16Bytes[0] = 0xFF
+        $utf16Bytes[1] = 0xFE
+        [System.Array]::Copy($utf16Body, 0, $utf16Bytes, 2, $utf16Body.Length)
+        $utf16Meta = Get-ClipboardHtmlHeaderMetadata -Bytes $utf16Bytes
+        Assert-Equal 'https://example.com/utf16' $utf16Meta.SourceURL 'utf-16 header'
+        Assert-True ((ConvertTo-Json $utf16Meta) -notmatch 'UTF16-SECRET-BODY') 'utf-16 body absent'
+
+        $textRow = New-ClipboardFormatRow -Id 13 -RegisteredName $null -ByteCount 24
+        Assert-Equal 'CF_UNICODETEXT' $textRow.Name 'row name'
+        Assert-Equal 'Text' $textRow.Class 'row class'
+        Assert-Equal 'False' $textRow.Chromium 'row not chromium'
+        Assert-Equal 24 $textRow.Bytes 'row size'
+        $htmlRow = New-ClipboardFormatRow -Id 49161 -RegisteredName 'HTML Format' -ByteCount $bytes.Length -HtmlBytes $bytes
+        Assert-Equal 'Html' $htmlRow.Class 'html row'
+        Assert-Equal 'https://example.com/notes' $htmlRow.HtmlHeader.SourceURL 'row header url'
+        Assert-True ((ConvertTo-Json $htmlRow) -notmatch [regex]::Escape($secret)) 'row json has no body'
+        $chromeRow = New-ClipboardFormatRow -Id 50000 -RegisteredName 'Chromium internal source URL' -ByteCount 40
+        Assert-Equal 'Chromium' $chromeRow.Class 'chromium row'
+        Assert-Equal 'True' $chromeRow.Chromium 'chromium flag'
+        $imageRow = New-ClipboardFormatRow -Id 2 -RegisteredName $null -ByteCount 0
+        Assert-Equal 'Protected' $imageRow.Class 'bitmap row'
+        $rtfRow = New-ClipboardFormatRow -Id 50001 -RegisteredName 'Rich Text Format' -ByteCount 12
+        Assert-Equal 'Other' $rtfRow.Class 'rtf row'
+        $unnamed = New-ClipboardFormatRow -Id 49152 -RegisteredName $null
+        Assert-Equal 'UNNAMED' $unnamed.Name 'unnamed row'
+        Assert-Equal 'Unnamed' $unnamed.Class 'unnamed class'
+        $skipped = New-ClipboardFormatRow -Id 49161 -RegisteredName 'HTML Format' -ByteCount 40 -HtmlBytes $bytes -MaxHtmlBytes 8
+        Assert-True ($null -eq $skipped.HtmlHeader) 'oversize html is not parsed'
+        Assert-True ((ConvertTo-Json $skipped) -notmatch [regex]::Escape($secret)) 'skipped bytes are not stored'
+        $listing = Format-ClipboardFormatListing -Rows @($textRow, $chromeRow, $htmlRow) -Sequence 7 -Timestamp '2026-11-21 08:00:00'
+        Assert-True ($listing.Contains('sequence=7')) 'listing sequence'
+        Assert-True ($listing.Contains('FORMAT_COUNT=3')) 'listing count'
+        Assert-True ($listing.Contains('[Chromium]')) 'listing flag'
+        Assert-True ($listing.Contains('HTML SourceURL=https://example.com/notes')) 'listing header'
+        Assert-True ($listing -notmatch [regex]::Escape($secret)) 'listing has no body'
+        $emptyListing = Format-ClipboardFormatListing -Rows @() -Sequence 0 -Timestamp 't'
+        Assert-True ($emptyListing.Contains('(empty)')) 'empty clipboard'
+
+        $payload = New-ClipboardMarkerPayload -PlainMarker 'PLAIN-MARKER' -HtmlMarker 'HTML-MARKER' -IncludeChromium $true
+        Assert-Equal 'PLAIN-MARKER' $payload.PlainText 'plain marker'
+        Assert-True ($payload.HtmlDocument.Contains('<b>HTML-MARKER</b>')) 'html marker wrapped'
+        Assert-True (-not $payload.HtmlDocument.Contains('PLAIN-MARKER')) 'markers differ'
+        $docBytes = $utf8.GetBytes($payload.HtmlDocument)
+        $slice = $utf8.GetString($docBytes, $payload.StartFragment, $payload.EndFragment - $payload.StartFragment)
+        Assert-Equal '<b>HTML-MARKER</b>' $slice 'fragment offsets'
+        Assert-Equal 'Chromium internal source URL' $payload.ChromiumFormatName 'chromium format'
+        Assert-Equal 3 @($payload.FormatNames).Count 'three formats'
+        $urlBytes = $utf8.GetBytes('https://example.invalid/clipboard-fix-test')
+        Assert-Equal $urlBytes.Length $payload.ChromiumBytes.Length 'chromium byte count'
+        Assert-Equal $urlBytes[0] $payload.ChromiumBytes[0] 'chromium prefix'
+        $plainOnly = New-ClipboardMarkerPayload
+        Assert-True ($null -eq $plainOnly.ChromiumBytes) 'chromium off'
+        Assert-Equal 2 @($plainOnly.FormatNames).Count 'text and html only'
+        $accent = 'HTML-' + [char]0x00C4
+        $wide = New-ClipboardMarkerPayload -HtmlMarker $accent
+        $wideBytes = $utf8.GetBytes($wide.HtmlDocument)
+        $wideSlice = $utf8.GetString($wideBytes, $wide.StartFragment, $wide.EndFragment - $wide.StartFragment)
+        Assert-Equal ('<b>' + $accent + '</b>') $wideSlice 'utf-8 fragment'
+        Assert-True (($wide.EndFragment - $wide.StartFragment) -gt ('<b>' + $accent + '</b>').Length) 'offset uses bytes'
+        $headerMeta = Get-ClipboardHtmlHeaderMetadata -Bytes $docBytes
+        Assert-Equal '0.9' $headerMeta.Version 'payload version'
+        Assert-Equal 'https://example.invalid/clipboard-fix-test' $headerMeta.SourceURL 'payload source'
+        Assert-True ((ConvertTo-Json $headerMeta) -notmatch 'HTML-MARKER') 'payload header has no marker'
+        $summary = Format-ClipboardMarkerSummary -Payload $payload -FormatNamesPresent @('UnicodeText', 'HTML Format') -Applied $true
+        Assert-True ($summary.Contains('PLAIN-MARKER')) 'summary names the plain marker'
+        Assert-True ($summary.Contains('HTML-MARKER')) 'summary names the html marker'
+        Assert-True ($summary -notmatch '<!--StartFragment-->') 'summary hides the document'
+        Assert-True ($summary -notmatch '<html') 'summary hides the html shell'
+        Assert-True ($summary -notmatch 'SourceURL') 'summary hides the header'
+        $preview = Format-ClipboardMarkerSummary -Payload $payload -FormatNamesPresent @() -Applied $false
+        Assert-True ($preview.Contains('was not changed')) 'preview does not claim a write'
+        $badToken = Test-ClipboardMarkerToken -Token ("SECRET-TOKEN-NEWLINE`n")
+        Assert-True ($null -ne $badToken) 'newline rejected'
+        Assert-True ($badToken -notmatch 'SECRET-TOKEN-NEWLINE') 'rejection hides the token'
+        $threw = $false
+        try { New-ClipboardMarkerPayload -PlainMarker ("x`ny") } catch { $threw = $true }
+        Assert-True $threw 'payload refuses a newline'
+    }
+
+    Invoke-Test 'entrypoint adds format listing and marker mode without a second rewriter' {
+        $root = Split-Path -Parent $CorePath
+        $entry = Join-Path $root 'clipboard-test.ps1'
+        $text = [System.IO.File]::ReadAllText($entry)
+        Assert-True ($text -match '\[switch\]\$Formats') 'formats switch'
+        Assert-True ($text -match '\[switch\]\$SetTestClipboard') 'marker switch'
+        Assert-True ($text -match 'namespace ClipDiagFormatList') 'format native namespace'
+        Assert-True ($text -match 'namespace ClipDiagV2') 'diagnose native namespace stayed'
+        Assert-True ($text -match '-ShowText is ignored for -Formats\.') 'formats ignores showtext'
+        Assert-True ($text -match '-ShowText is ignored for -SetTestClipboard\.') 'marker ignores showtext'
+        Assert-True ($text -match 'Do not run the tray and -PlainText at the same time') 'rewriter race is stated'
+        Assert-True ($text -match 'require -SetTestClipboard') 'marker switches require their mode'
+        Assert-True ($text -match '-Seconds is ignored for -SetTestClipboard\.') 'seconds ignored'
+        Assert-True ($text -match "BoundParams.Remove\('PlainMarker'\)") 'report drops the plain marker'
+        Assert-True ($text -notmatch 'Watch-PlainTextClipboard') 'standalone watcher was not copied'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'Watch-PlainTextClipboard.ps1'))) 'no second watcher file'
+        $tray = [System.IO.File]::ReadAllText((Join-Path $root 'clipboard-tray.ps1'))
+        Assert-True ($tray -match 'AddClipboardFormatListener') 'tray keeps the event listener'
+    }
+
     Invoke-Test 'README documents the 600 second plain-text example' {
         $readme = Join-Path (Split-Path -Parent $CorePath) 'README.md'
         $text = [System.IO.File]::ReadAllText($readme)
@@ -619,6 +788,20 @@ try {
         Assert-True ($text -match '2026-11-05-plaintext-tray-design\.md') 'design link remains'
         Assert-True ($text -match 'not a Cursor patch') 'safety wording remains'
         Assert-True ($text -match 'does not prove malware') 'malware wording remains'
+        Assert-True ($text -match 'clipboard-test\.ps1 -Formats') 'formats example'
+        Assert-True ($text -match 'clipboard-test\.ps1 -SetTestClipboard') 'marker example'
+        Assert-True ($text -match 'docs/copilot-html-paste\.md') 'paste doc link'
+        Assert-True ($text -match 'Do not run the tray and `clipboard-test\.ps1 -PlainText` at the same time') 'rewriter race'
+        $docPath = Join-Path (Join-Path (Split-Path -Parent $readme) 'docs') 'copilot-html-paste.md'
+        $doc = [System.IO.File]::ReadAllText($docPath)
+        Assert-True ($doc -match 'HTML Format') 'doc names HTML Format'
+        Assert-True ($doc -match 'Ctrl\+Shift\+V') 'doc names paste as plain text'
+        Assert-True ($doc -match 'chat box') 'doc names the chat box'
+        Assert-True ($doc -match 'canvas') 'doc names the canvas'
+        Assert-True ($doc -match 'PLAIN-MARKER') 'doc names the plain marker'
+        Assert-True ($doc -match 'HTML-MARKER') 'doc names the html marker'
+        Assert-True ($doc -match 'HyperFrames') 'doc names HyperFrames'
+        Assert-True ($doc -match 'Layer-isolation') 'doc has the layer plan'
     }
 }
 finally {

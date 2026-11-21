@@ -598,6 +598,397 @@ function Publish-ClipboardStoreEvents {
     }
 }
 
+function Get-ClipboardProtectedFormatNames {
+    <#
+    .SYNOPSIS
+        Format names that suppress a plain-text rewrite.
+    .NOTES
+        Includes the CF_* constants from the tray design and the WinForms names
+        GetFormats() actually returns for those same image and file formats.
+        Wave audio, palette, and OLE Embed Source stay unprotected.
+    #>
+    @(
+        'CF_BITMAP', 'CF_DIB', 'CF_DIBV5', 'CF_TIFF', 'CF_HDROP', 'CF_ENHMETAFILE', 'CF_METAFILEPICT',
+        'Bitmap', 'System.Drawing.Bitmap', 'DeviceIndependentBitmap', 'Format17',
+        'FileDrop', 'FileName', 'FileNameW', 'PNG', 'image/png',
+        'TaggedImageFileFormat', 'EnhancedMetafile', 'MetaFilePict', 'Dib', 'DibV5', 'TIFF'
+    )
+}
+
+function Get-ClipboardTriggerFormatNames {
+    <#
+    .SYNOPSIS
+        Format names that request a plain-text rewrite.
+    .NOTES
+        Chromium Internal Source URL is intentionally absent. A Chromium name
+        is still flagged by Test-ChromiumClipboardFormatName for format listing.
+    #>
+    @('HTML Format', 'text/html', 'Chromium Web Custom MIME Data Format')
+}
+
+function Get-StandardClipboardFormatName {
+    <#
+    .SYNOPSIS
+        Map a standard clipboard format id to its CF_* name.
+    .NOTES
+        Pure. Private registered ids return null. Audit Notes: no clipboard access.
+    #>
+    param([uint32]$Id)
+    switch ($Id) {
+        1 { return 'CF_TEXT' }
+        2 { return 'CF_BITMAP' }
+        3 { return 'CF_METAFILEPICT' }
+        4 { return 'CF_SYLK' }
+        5 { return 'CF_DIF' }
+        6 { return 'CF_TIFF' }
+        7 { return 'CF_OEMTEXT' }
+        8 { return 'CF_DIB' }
+        9 { return 'CF_PALETTE' }
+        10 { return 'CF_PENDATA' }
+        11 { return 'CF_RIFF' }
+        12 { return 'CF_WAVE' }
+        13 { return 'CF_UNICODETEXT' }
+        14 { return 'CF_ENHMETAFILE' }
+        15 { return 'CF_HDROP' }
+        16 { return 'CF_LOCALE' }
+        17 { return 'CF_DIBV5' }
+        128 { return 'CF_OWNERDISPLAY' }
+        129 { return 'CF_DSPTEXT' }
+        130 { return 'CF_DSPBITMAP' }
+        131 { return 'CF_DSPMETAFILEPICT' }
+        142 { return 'CF_DSPENHMETAFILE' }
+        default { return $null }
+    }
+}
+
+function Format-ClipboardFormatDisplayName {
+    <#
+    .SYNOPSIS
+        Choose the label printed for one clipboard format.
+    .NOTES
+        Pure. Never includes format bytes. Audit Notes: no clipboard access.
+    #>
+    param(
+        [AllowNull()][string]$StandardName,
+        [AllowNull()][string]$RegisteredName
+    )
+    $hasStandard = -not [string]::IsNullOrWhiteSpace($StandardName)
+    $hasRegistered = -not [string]::IsNullOrWhiteSpace($RegisteredName)
+    if ($hasStandard -and $hasRegistered) { return "$StandardName / $RegisteredName" }
+    if ($hasStandard) { return $StandardName }
+    if ($hasRegistered) { return $RegisteredName }
+    return 'UNNAMED'
+}
+
+function Test-ChromiumClipboardFormatName {
+    <#
+    .SYNOPSIS
+        True when a format name is one of Chromium's private clipboard formats.
+    .NOTES
+        Listing flag only. This is not a rewrite trigger.
+    #>
+    param([AllowNull()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return [bool]($Name -match 'Chromium')
+}
+
+function Test-ClipboardHtmlFormatName {
+    <#
+    .SYNOPSIS
+        True when the format is CF_HTML (HTML Format).
+    .NOTES
+        Pure. Used to decide whether header fields may be parsed.
+    #>
+    param(
+        [AllowNull()][string]$Name,
+        [AllowNull()][string]$RegisteredName
+    )
+    if ([string]::Equals($RegisteredName, 'HTML Format', [System.StringComparison]::Ordinal)) { return $true }
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return [bool]($Name -match 'HTML Format')
+}
+
+function Get-ClipboardFormatClass {
+    <#
+    .SYNOPSIS
+        Classify one format name for listing. Does not decide a rewrite.
+    .OUTPUTS
+        Unnamed, Chromium, Html, Protected, Text, or Other.
+    #>
+    param([AllowNull()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -eq 'UNNAMED') { return 'Unnamed' }
+    if (Test-ChromiumClipboardFormatName -Name $Name) { return 'Chromium' }
+    if ((Test-ClipboardHtmlFormatName -Name $Name) -or [string]::Equals($Name, 'text/html', [System.StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($Name, 'Html', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return 'Html'
+    }
+    foreach ($item in @(Get-ClipboardProtectedFormatNames)) {
+        if ([string]::Equals($Name, $item, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Protected' }
+    }
+    foreach ($item in @('UnicodeText', 'Text', 'OEMText', 'Locale', 'System.String', 'CF_TEXT', 'CF_UNICODETEXT', 'CF_OEMTEXT', 'CF_LOCALE')) {
+        if ([string]::Equals($Name, $item, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Text' }
+    }
+    return 'Other'
+}
+
+function ConvertTo-SafeClipboardSourceUrl {
+    <#
+    .SYNOPSIS
+        Reduce a CF_HTML SourceURL to scheme, host, and path.
+    .NOTES
+        Drops userinfo, query, and fragment. Unparseable values become a length
+        note so a token in the raw URL is not returned.
+    #>
+    param([AllowNull()][string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $Url }
+    try {
+        $uri = $null
+        if ([Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -and $null -ne $uri -and -not [string]::IsNullOrWhiteSpace($uri.Host)) {
+            return ('{0}://{1}{2}' -f $uri.Scheme, $uri.Host, $uri.AbsolutePath)
+        }
+    }
+    catch { }
+    return ('unparseable (len={0})' -f $Url.Length)
+}
+
+function Get-ClipboardHtmlHeaderMetadata {
+    <#
+    .SYNOPSIS
+        Read CF_HTML header fields and drop the fragment body.
+    .NOTES
+        Returns Version, StartHTML, EndHTML, StartFragment, EndFragment, and a
+        sanitized SourceURL when those fields sit in the header. The fragment
+        body is never a return value.
+    #>
+    param([AllowNull()][byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return $null }
+    $text = $null
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+        $text = [System.Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2)
+    }
+    else {
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        $text = $utf8.GetString($Bytes)
+    }
+    $header = $text
+    $sliced = $false
+    $startMatch = [regex]::Match($text, 'StartHTML:\s*(-?\d+)')
+    if ($startMatch.Success) {
+        $start = 0
+        $parsed = [int]::TryParse($startMatch.Groups[1].Value, [ref]$start)
+        if ($parsed -and $start -ge 0 -and $start -le $text.Length) {
+            $header = $text.Substring(0, $start)
+            $sliced = $true
+        }
+    }
+    if (-not $sliced) {
+        $lt = $text.IndexOf('<')
+        if ($lt -gt 0) { $header = $text.Substring(0, $lt) }
+        elseif ($text.Length -gt 512) { $header = $text.Substring(0, 512) }
+    }
+    $meta = [ordered]@{}
+    foreach ($key in @('Version', 'StartHTML', 'EndHTML', 'StartFragment', 'EndFragment', 'SourceURL')) {
+        $found = [regex]::Match($header, "(?m)^${key}:(.*)$")
+        if ($found.Success) {
+            $val = $found.Groups[1].Value.Trim().Trim([char]0)
+            if ($key -eq 'SourceURL') { $val = ConvertTo-SafeClipboardSourceUrl -Url $val }
+            $meta[$key] = $val
+        }
+    }
+    if ($meta.Count -eq 0) { return $null }
+    return $meta
+}
+
+function Test-ClipboardMarkerToken {
+    <#
+    .SYNOPSIS
+        Reject a marker that cannot be printed as a single safe token.
+    .NOTES
+        Returns an error string, or null when the token is usable. The token
+        value is not included in the error.
+    #>
+    param([AllowNull()][string]$Token)
+    if ([string]::IsNullOrEmpty($Token)) { return 'Marker is empty.' }
+    if ($Token.Length -gt 200) { return 'Marker is longer than 200 characters.' }
+    if ($Token.IndexOf('"') -ge 0 -or $Token.IndexOf("`r") -ge 0 -or $Token.IndexOf("`n") -ge 0) {
+        return 'Marker cannot contain quotes or newlines.'
+    }
+    return $null
+}
+
+function New-ClipboardMarkerPayload {
+    <#
+    .SYNOPSIS
+        Build a CF_HTML document whose visible fragment differs from the plain-text marker.
+    .NOTES
+        Does not touch the clipboard. Offsets are UTF-8 byte offsets. The
+        returned object includes the HTML document so the caller can place it
+        on the clipboard; logs must not print HtmlDocument.
+    #>
+    param(
+        [string]$PlainMarker = 'PLAIN-MARKER',
+        [string]$HtmlMarker = 'HTML-MARKER',
+        [bool]$IncludeChromium = $false,
+        [string]$SourceUrl = 'https://example.invalid/clipboard-fix-test'
+    )
+    $plainError = Test-ClipboardMarkerToken -Token $PlainMarker
+    if ($null -ne $plainError) { throw "PlainMarker: $plainError" }
+    $htmlError = Test-ClipboardMarkerToken -Token $HtmlMarker
+    if ($null -ne $htmlError) { throw "HtmlMarker: $htmlError" }
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $headerTemplate = "Version:0.9`r`nStartHTML:{0}`r`nEndHTML:{1}`r`nStartFragment:{2}`r`nEndFragment:{3}`r`nSourceURL:{4}`r`n"
+    $pad = '0' * 10
+    $dummy = $headerTemplate -f $pad, $pad, $pad, $pad, $SourceUrl
+    $pre = "<html>`r`n<body>`r`n<!--StartFragment-->"
+    $fragment = '<b>' + $HtmlMarker + '</b>'
+    $post = "<!--EndFragment-->`r`n</body>`r`n</html>"
+    $dummyBytes = $utf8.GetByteCount($dummy)
+    $startHTML = $dummyBytes
+    $startFragment = $startHTML + $utf8.GetByteCount($pre)
+    $endFragment = $startFragment + $utf8.GetByteCount($fragment)
+    $endHTML = $endFragment + $utf8.GetByteCount($post)
+    $header = $headerTemplate -f @(
+        $startHTML.ToString('D10'),
+        $endHTML.ToString('D10'),
+        $startFragment.ToString('D10'),
+        $endFragment.ToString('D10'),
+        $SourceUrl
+    )
+    if ($utf8.GetByteCount($header) -ne $dummyBytes) {
+        throw ('CF_HTML header length mismatch ({0} vs {1})' -f $utf8.GetByteCount($header), $dummyBytes)
+    }
+    $formats = New-Object System.Collections.Generic.List[string]
+    [void]$formats.Add('UnicodeText')
+    [void]$formats.Add('HTML Format')
+    $chromiumName = $null
+    $chromiumBytes = $null
+    if ($IncludeChromium) {
+        $chromiumName = 'Chromium internal source URL'
+        $chromiumBytes = $utf8.GetBytes($SourceUrl)
+        [void]$formats.Add($chromiumName)
+    }
+    [pscustomobject]@{
+        PlainText           = [string]$PlainMarker
+        HtmlMarker          = [string]$HtmlMarker
+        HtmlDocument        = [string]($header + $pre + $fragment + $post)
+        SourceUrl           = [string]$SourceUrl
+        StartHTML           = [int]$startHTML
+        EndHTML             = [int]$endHTML
+        StartFragment       = [int]$startFragment
+        EndFragment         = [int]$endFragment
+        ChromiumFormatName  = $chromiumName
+        ChromiumBytes       = $chromiumBytes
+        FormatNames         = $formats.ToArray()
+    }
+}
+
+function Format-ClipboardMarkerSummary {
+    <#
+    .SYNOPSIS
+        Console text for a marker payload. Prints the markers, not the HTML document.
+    #>
+    param(
+        $Payload,
+        [string[]]$FormatNamesPresent = @(),
+        [bool]$Applied = $true
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($Applied) {
+        [void]$lines.Add('Set-TestClipboard: crafted payload is on the clipboard (metadata only).')
+    }
+    else {
+        [void]$lines.Add('Set-TestClipboard: preview only. The clipboard was not changed.')
+    }
+    [void]$lines.Add(('  Plain text marker: {0}  (chars={1})' -f $Payload.PlainText, $Payload.PlainText.Length))
+    [void]$lines.Add(('  HTML fragment marker: {0}  (wrapped in <b>...</b>)' -f $Payload.HtmlMarker))
+    $chromium = 'no'
+    if (-not [string]::IsNullOrWhiteSpace([string]$Payload.ChromiumFormatName)) {
+        $chromium = 'yes (' + [string]$Payload.ChromiumFormatName + ')'
+    }
+    [void]$lines.Add(('  Chromium fake format: {0}' -f $chromium))
+    $present = @($FormatNamesPresent | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    [void]$lines.Add(('  Formats now present ({0}): {1}' -f $present.Count, ([string]::Join(', ', $present))))
+    [void]$lines.Add(('Paste into the target. {0} means Unicode text. {1} means HTML Format was rendered. A blank paste means HTML was chosen and stripped.' -f $Payload.PlainText, $Payload.HtmlMarker))
+    return ($lines -join "`n")
+}
+
+function New-ClipboardFormatRow {
+    <#
+    .SYNOPSIS
+        Build one format-listing row from an id, a registered name, and optional HTML bytes.
+    .NOTES
+        HTML bytes are parsed for header fields and then discarded. They are not
+        a property of the row.
+    #>
+    param(
+        [uint32]$Id,
+        [AllowNull()][string]$RegisteredName,
+        $ByteCount = $null,
+        [AllowNull()][byte[]]$HtmlBytes = $null,
+        [int]$MaxHtmlBytes = 20971520
+    )
+    $standard = Get-StandardClipboardFormatName -Id $Id
+    $name = Format-ClipboardFormatDisplayName -StandardName $standard -RegisteredName $RegisteredName
+    $htmlHeader = $null
+    $isHtml = Test-ClipboardHtmlFormatName -Name $name -RegisteredName $RegisteredName
+    if ($isHtml -and $null -ne $HtmlBytes -and $HtmlBytes.Length -gt 0 -and $HtmlBytes.Length -le $MaxHtmlBytes) {
+        $htmlHeader = Get-ClipboardHtmlHeaderMetadata -Bytes $HtmlBytes
+    }
+    $bytesOut = $null
+    if ($null -ne $ByteCount -and -not [string]::IsNullOrWhiteSpace([string]$ByteCount)) {
+        $bytesOut = [uint64]$ByteCount
+    }
+    $class = 'Unnamed'
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($standard)) { $candidates += (Get-ClipboardFormatClass -Name $standard) }
+    if (-not [string]::IsNullOrWhiteSpace($RegisteredName)) { $candidates += (Get-ClipboardFormatClass -Name $RegisteredName) }
+    foreach ($preferred in @('Chromium', 'Html', 'Protected', 'Text', 'Other')) {
+        if ($candidates -contains $preferred) { $class = $preferred; break }
+    }
+    $chromium = (Test-ChromiumClipboardFormatName -Name $standard) -or (Test-ChromiumClipboardFormatName -Name $RegisteredName) -or (Test-ChromiumClipboardFormatName -Name $name)
+    [pscustomobject]@{
+        Id         = [uint32]$Id
+        Name       = [string]$name
+        Bytes      = $bytesOut
+        Class      = [string]$class
+        Chromium   = [bool]$chromium
+        HtmlHeader = $htmlHeader
+    }
+}
+
+function Format-ClipboardFormatListing {
+    <#
+    .SYNOPSIS
+        Render a format listing from rows. Header fields only; no HTML body.
+    #>
+    param(
+        $Rows,
+        [uint32]$Sequence = 0,
+        [string]$Timestamp = ''
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add(('=== Clipboard formats  {0}  sequence={1} ===' -f $Timestamp, $Sequence))
+    $list = @()
+    if ($null -ne $Rows) { $list = @($Rows) }
+    if ($list.Count -eq 0) {
+        [void]$lines.Add('(empty)')
+        return ($lines -join "`n")
+    }
+    [void]$lines.Add(('FORMAT_COUNT={0}' -f $list.Count))
+    foreach ($row in $list) {
+        if ($null -eq $row) { continue }
+        $bytes = if ($null -eq $row.Bytes) { 'n/a' } else { [string]$row.Bytes }
+        $flag = ''
+        if ($row.Chromium) { $flag = '  [Chromium]' }
+        [void]$lines.Add(('  id={0,-6}  bytes={1,-10}  {2}{3}' -f $row.Id, $bytes, $row.Name, $flag))
+        if ($null -ne $row.HtmlHeader) {
+            foreach ($key in @($row.HtmlHeader.Keys)) {
+                [void]$lines.Add(('           HTML {0}={1}' -f $key, $row.HtmlHeader[$key]))
+            }
+        }
+    }
+    return ($lines -join "`n")
+}
+
 function Test-ClipboardNeedsPlainText {
     param(
         [string[]]$FormatNames = @(),
@@ -607,12 +998,8 @@ function Test-ClipboardNeedsPlainText {
     if ($names.Count -eq 0) {
         return [pscustomobject]@{ NeedsRewrite = $false; Reason = 'EmptyClipboard' }
     }
-    $protected = @(
-        'CF_BITMAP', 'CF_DIB', 'CF_DIBV5', 'CF_TIFF', 'CF_HDROP', 'CF_ENHMETAFILE', 'CF_METAFILEPICT',
-        'Bitmap', 'System.Drawing.Bitmap', 'DeviceIndependentBitmap', 'Format17',
-        'FileDrop', 'FileName', 'FileNameW', 'PNG', 'image/png'
-    )
-    $triggers = @('HTML Format', 'text/html', 'Chromium Web Custom MIME Data Format')
+    $protected = @(Get-ClipboardProtectedFormatNames)
+    $triggers = @(Get-ClipboardTriggerFormatNames)
     $isProtected = $false
     $isTrigger = $false
     foreach ($name in $names) {
@@ -911,7 +1298,9 @@ function Get-ClipboardRunMode {
         [bool]$ExportForCursor,
         [bool]$TerminalPaste,
         [bool]$BrowserTest,
-        [bool]$BrowserPasteTest
+        [bool]$BrowserPasteTest,
+        [bool]$Formats = $false,
+        [bool]$SetTestClipboard = $false
     )
     $modes = New-Object System.Collections.Generic.List[string]
     if ($ExportForCursor) { $modes.Add('ExportForCursor') }
@@ -920,8 +1309,16 @@ function Get-ClipboardRunMode {
     if ($BrowserTest) { $modes.Add('BrowserTest') }
     if ($BrowserPasteTest) { $modes.Add('BrowserPasteTest') }
     if ($PlainText) { $modes.Add('PlainText') }
+    if ($Formats) { $modes.Add('Formats') }
+    if ($SetTestClipboard) { $modes.Add('SetTestClipboard') }
     if ($PlainText -and ($Fix -or $modes.Count -gt 1)) {
         return [pscustomobject]@{ Mode = 'PlainText'; ExitCode = 2 }
+    }
+    if ($Formats -and ($Fix -or $modes.Count -gt 1)) {
+        return [pscustomobject]@{ Mode = 'Formats'; ExitCode = 2 }
+    }
+    if ($SetTestClipboard -and ($Fix -or $modes.Count -gt 1)) {
+        return [pscustomobject]@{ Mode = 'SetTestClipboard'; ExitCode = 2 }
     }
     if ($modes.Count -gt 1) {
         return [pscustomobject]@{ Mode = $modes[0]; ExitCode = 2 }
